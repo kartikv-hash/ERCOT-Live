@@ -388,8 +388,7 @@ if view == "📅 Single Day — 24H":
     with st.expander("🕐 HOURLY PRICE TABLE"):
         pivot = filt.pivot_table(index="datetime", columns="bus", values="lmp").round(2)
         pivot.index = pivot.index.strftime("%H:%M")
-        st.dataframe(pivot.style.background_gradient(cmap="RdYlGn_r", axis=None),
-                     use_container_width=True)
+        st.dataframe(pivot, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SUMMARY TABLE — monthly
