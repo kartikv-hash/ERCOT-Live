@@ -6,8 +6,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta, date
 from io import BytesIO
 import zipfile
-import calendar
-import re
+import requests
 
 st.set_page_config(page_title="ERCOT LMP", page_icon="⚡", layout="wide")
 
@@ -45,17 +44,6 @@ st.markdown("""
 .shdr { font-family:'Orbitron',monospace; font-size:10px; color:#00ff9970;
     text-transform:uppercase; letter-spacing:3px;
     border-left:2px solid #00ff99; padding-left:10px; margin:16px 0 12px; }
-.upload-box { background:linear-gradient(135deg,#050520,#0a0a2e);
-    border:2px dashed #00ff9940; border-radius:8px; padding:30px;
-    text-align:center; margin:20px 0; }
-.upload-title { font-family:'Orbitron',monospace; font-size:18px;
-    color:#00ff99; text-shadow:0 0 15px #00ff9980; margin-bottom:10px; }
-.upload-sub { font-size:13px; color:#00ff9960; letter-spacing:1px; }
-.step-box { background:#050520; border:1px solid #00ff9920; border-radius:6px;
-    padding:14px 18px; margin:8px 0; display:flex; align-items:center; gap:12px; }
-.step-num { font-family:'Orbitron',monospace; font-size:20px; color:#00ff99;
-    font-weight:900; text-shadow:0 0 10px #00ff99; min-width:32px; }
-.step-txt { font-size:13px; color:#aaa; letter-spacing:0.5px; }
 .stButton>button { background:linear-gradient(135deg,#00ff9915,#00aaff15) !important;
     border:1px solid #00ff9950 !important; color:#00ff99 !important;
     font-family:'Orbitron',monospace !important; font-size:10px !important;
@@ -71,23 +59,72 @@ def rgba(h, a=0.15):
     return f"rgba({int(h[:2],16)},{int(h[2:4],16)},{int(h[4:],16)},{a})"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ERCOT API FETCH
+# ─────────────────────────────────────────────────────────────────────────────
+BASE_URL = "https://api.ercot.com/api/public-reports/np4-183-cd"
+
+def fetch_ercot(api_key: str, date_from: str, date_to: str, page_size: int = 200) -> pd.DataFrame:
+    """Fetch NP4-183-CD from ERCOT API and return a clean DataFrame."""
+    headers = {
+        "Ocp-Apim-Subscription-Key": api_key,
+        "Accept": "application/json",
+    }
+    all_records = []
+    page = 1
+
+    prog = st.progress(0, text="⚡ Fetching from ERCOT API...")
+    while True:
+        params = {
+            "deliveryDateFrom": date_from,
+            "deliveryDateTo":   date_to,
+            "size": page_size,
+            "page": page,
+        }
+        r = requests.get(BASE_URL, headers=headers, params=params, timeout=30)
+        if not r.ok:
+            prog.empty()
+            raise ValueError(f"API error {r.status_code}: {r.text[:300]}")
+
+        data = r.json()
+        records = data.get("data", [])
+        if not records:
+            break
+
+        all_records.extend(records)
+        total = data.get("totalCount", len(all_records))
+        pct   = min(len(all_records) / max(total, 1), 1.0)
+        prog.progress(pct, text=f"⚡ {len(all_records):,} / {total:,} records...")
+
+        if len(all_records) >= total:
+            break
+        page += 1
+
+    prog.empty()
+
+    if not all_records:
+        raise ValueError("API returned 0 records for the selected date range.")
+
+    df = pd.DataFrame(all_records)
+    return normalize_df(df)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PARSE ZIP → DATAFRAME
 # ─────────────────────────────────────────────────────────────────────────────
-def parse_zip(file_bytes: bytes) -> tuple[pd.DataFrame, list]:
-    """Parse ERCOT NP4-183-CD zip into clean DataFrame. Returns (df, raw_columns)."""
+def parse_zip(file_bytes: bytes) -> pd.DataFrame:
     with zipfile.ZipFile(BytesIO(file_bytes)) as z:
         csvs = [f for f in z.namelist() if f.lower().endswith(".csv")]
         if not csvs:
             raise ValueError(f"No CSV in zip. Files: {z.namelist()}")
         with z.open(csvs[0]) as f:
             raw   = f.read().decode("utf-8", errors="replace")
-            # Skip comment/header lines starting with #
             lines = [l for l in raw.splitlines() if not l.startswith("#")]
             df    = pd.read_csv(BytesIO("\n".join(lines).encode()), low_memory=False)
+    return normalize_df(df)
 
-    raw_cols = list(df.columns)
 
-    # ── Normalize column names ─────────────────────────────────────────────
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize columns and build datetime — works for both API JSON and CSV."""
     df.columns = [c.strip() for c in df.columns]
     col_lower  = {c: c.lower().replace(" ","").replace("_","") for c in df.columns}
 
@@ -107,15 +144,13 @@ def parse_zip(file_bytes: bytes) -> tuple[pd.DataFrame, list]:
     df = df.rename(columns=rename)
 
     if "lmp" not in df.columns:
-        raise ValueError(f"Cannot find LMP price column. Columns found: {raw_cols}")
+        raise ValueError(f"Cannot find LMP price column. Columns: {list(df.columns)}")
     if "bus" not in df.columns:
-        raise ValueError(f"Cannot find Bus/Node column. Columns found: {raw_cols}")
+        raise ValueError(f"Cannot find Bus/Node column. Columns: {list(df.columns)}")
 
     df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce")
 
-    # ── Build datetime ─────────────────────────────────────────────────────
     if "date" in df.columns and "hour" in df.columns:
-        # HourEnding is 1-24 in ERCOT → offset 0-23
         hr_str = df["hour"].astype(str).str.replace(":00","").str.strip()
         hr     = pd.to_numeric(hr_str, errors="coerce").fillna(1)
         df["datetime"] = pd.to_datetime(df["date"], errors="coerce") + \
@@ -123,16 +158,17 @@ def parse_zip(file_bytes: bytes) -> tuple[pd.DataFrame, list]:
     elif "date" in df.columns:
         df["datetime"] = pd.to_datetime(df["date"], errors="coerce")
     else:
-        raise ValueError(f"Cannot find date column. Columns: {raw_cols}")
+        raise ValueError(f"Cannot find date column. Columns: {list(df.columns)}")
 
-    return df[["datetime","bus","lmp"]].dropna().sort_values("datetime"), raw_cols
+    return df[["datetime","bus","lmp"]].dropna().sort_values("datetime")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
-if "data" not in st.session_state:
-    st.session_state.data = None
+for key in ["data", "api_key"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER
@@ -141,97 +177,80 @@ st.markdown('<div class="title-glow">⚡ ERCOT LMP COMMAND CENTER</div>', unsafe
 st.markdown('<div class="subtitle">Day-Ahead Market // Locational Marginal Prices // $/MWh</div>', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UPLOAD SECTION — shown until data is loaded
+# LOAD DATA SECTION
 # ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.data is None:
-    st.markdown("""
-    <div class="upload-box">
-        <div class="upload-title">⚡ LOAD ERCOT DATA</div>
-        <div class="upload-sub">Upload one or more NP4-183-CD zip files to begin</div>
-    </div>
-    """, unsafe_allow_html=True)
+    tab_api, tab_zip = st.tabs(["🔑 API (Live Pull)", "📁 Upload ZIP"])
 
-    col1, col2 = st.columns([1,1])
-    with col1:
-        st.markdown("#### How to download from ERCOT:")
-        st.markdown("""
-        <div class="step-box"><div class="step-num">1</div>
-        <div class="step-txt">Go to <a href="https://data.ercot.com/data-product-archive/NP4-183-CD"
-        style="color:#00ff99" target="_blank">data.ercot.com/data-product-archive/NP4-183-CD</a></div></div>
-        <div class="step-box"><div class="step-num">2</div>
-        <div class="step-txt">Select your date(s) and click the download icon ⬇</div></div>
-        <div class="step-box"><div class="step-num">3</div>
-        <div class="step-txt">Upload the zip file(s) below — supports multiple files for monthly view</div></div>
-        """, unsafe_allow_html=True)
+    # ── API TAB ───────────────────────────────────────────────────────────
+    with tab_api:
+        st.markdown('<div class="shdr">ERCOT API — NP4-183-CD</div>', unsafe_allow_html=True)
+        api_key   = st.text_input("API Subscription Key", type="password",
+                                   value=st.session_state.api_key or "",
+                                   placeholder="Ocp-Apim-Subscription-Key")
+        c1, c2 = st.columns(2)
+        with c1:
+            d_from = st.date_input("Date From", value=date.today() - timedelta(days=1))
+        with c2:
+            d_to   = st.date_input("Date To",   value=date.today() - timedelta(days=1))
 
-    with col2:
-        st.markdown("#### Tips:")
-        st.markdown("""
-        <div class="step-box"><div class="step-num">📅</div>
-        <div class="step-txt"><b>Single day:</b> Upload 1 zip file → plots 24-hour LMP</div></div>
-        <div class="step-box"><div class="step-num">📆</div>
-        <div class="step-txt"><b>Monthly view:</b> Upload multiple zips → plots daily average LMP</div></div>
-        <div class="step-box"><div class="step-num">💡</div>
-        <div class="step-txt">Data is cached in session — no need to re-upload on refresh</div></div>
-        """, unsafe_allow_html=True)
+        if st.button("⚡ FETCH FROM ERCOT API", use_container_width=True):
+            if not api_key:
+                st.error("Enter your API key.")
+            elif d_from > d_to:
+                st.error("Date From must be ≤ Date To.")
+            else:
+                try:
+                    df = fetch_ercot(api_key, str(d_from), str(d_to))
+                    st.session_state.data    = df
+                    st.session_state.api_key = api_key
+                    st.success(f"✅ {len(df):,} records | {df['bus'].nunique()} buses | {d_from} → {d_to}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ {e}")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    ups = st.file_uploader(
-        "DROP ZIP FILE(S) HERE",
-        type="zip",
-        accept_multiple_files=True,
-        help="Download from data.ercot.com/data-product-archive/NP4-183-CD"
-    )
-
-    if ups:
-        all_dfs = []; errors = []
-        pb = st.progress(0, text="⚡ Parsing files...")
-        for i, up in enumerate(ups):
-            pb.progress((i+1)/len(ups), text=f"⚡ Parsing {up.name}...")
-            try:
-                df, raw_cols = parse_zip(up.read())
-                all_dfs.append(df)
-                st.success(f"✅ **{up.name}** — {len(df):,} records | {df['bus'].nunique()} buses | {df['datetime'].min().date()} → {df['datetime'].max().date()}")
-            except Exception as e:
-                errors.append(f"❌ {up.name}: {e}")
-                st.error(f"❌ **{up.name}**: {e}")
-        pb.empty()
-
-        if all_dfs:
-            st.session_state.data = pd.concat(all_dfs, ignore_index=True)
-            st.rerun()
+    # ── ZIP TAB ───────────────────────────────────────────────────────────
+    with tab_zip:
+        st.markdown('<div class="shdr">UPLOAD NP4-183-CD ZIP FILE(S)</div>', unsafe_allow_html=True)
+        ups = st.file_uploader("DROP ZIP FILE(S) HERE", type="zip",
+                                accept_multiple_files=True)
+        if ups:
+            all_dfs = []
+            pb = st.progress(0, text="⚡ Parsing files...")
+            for i, up in enumerate(ups):
+                pb.progress((i+1)/len(ups), text=f"⚡ Parsing {up.name}...")
+                try:
+                    df = parse_zip(up.read())
+                    all_dfs.append(df)
+                    st.success(f"✅ **{up.name}** — {len(df):,} records | {df['bus'].nunique()} buses | {df['datetime'].min().date()} → {df['datetime'].max().date()}")
+                except Exception as e:
+                    st.error(f"❌ **{up.name}**: {e}")
+            pb.empty()
+            if all_dfs:
+                st.session_state.data = pd.concat(all_dfs, ignore_index=True)
+                st.rerun()
 
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA LOADED — MAIN DASHBOARD
+# MAIN DASHBOARD
 # ─────────────────────────────────────────────────────────────────────────────
-data = st.session_state.data
-
-# Date range in loaded data
+data     = st.session_state.data
 min_date = data["datetime"].dt.date.min()
 max_date = data["datetime"].dt.date.max()
 n_days   = (max_date - min_date).days + 1
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────────────────────────────────────
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="title-glow" style="font-size:16px">⚡ ERCOT LMP</div>', unsafe_allow_html=True)
     st.markdown(f'<div style="font-size:9px;color:#00ff9930;letter-spacing:2px;margin-bottom:12px">DATA: {min_date} → {max_date}<br>{len(data):,} RECORDS LOADED</div>', unsafe_allow_html=True)
 
-    # View mode
-    if n_days == 1:
-        view = "📅 Single Day — 24H"
-        st.markdown(f'<div style="font-size:11px;color:#00ff9960">MODE: 24H VIEW — {min_date}</div>', unsafe_allow_html=True)
-    else:
-        view = st.radio("MODE", ["📅 Single Day — 24H", "📆 Monthly Average"])
+    view = "📅 Single Day — 24H" if n_days == 1 else \
+           st.radio("MODE", ["📅 Single Day — 24H", "📆 Monthly Average"])
 
-    # Date selector for single day
     if view == "📅 Single Day — 24H" and n_days > 1:
         available = sorted(data["datetime"].dt.date.unique())
-        sel_date  = st.selectbox("SELECT DATE", available,
-                                  index=len(available)-1,
+        sel_date  = st.selectbox("SELECT DATE", available, index=len(available)-1,
                                   format_func=lambda d: d.strftime("%Y-%m-%d"))
     else:
         sel_date = min_date
@@ -241,14 +260,27 @@ with st.sidebar:
     ma_w    = st.slider("MA Window", 2, 14, 3) if show_ma else 3
 
     st.markdown("---")
+
+    # Re-fetch with API key if available
+    if st.session_state.api_key:
+        st.markdown('<div class="shdr" style="margin-bottom:8px">FETCH NEW DATE RANGE</div>', unsafe_allow_html=True)
+        rf_from = st.date_input("From", value=min_date, key="rf_from")
+        rf_to   = st.date_input("To",   value=max_date, key="rf_to")
+        if st.button("⚡ REFETCH API", use_container_width=True):
+            try:
+                df = fetch_ercot(st.session_state.api_key, str(rf_from), str(rf_to))
+                st.session_state.data = df
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+        st.markdown("---")
+
     if st.button("📂 LOAD NEW FILES", use_container_width=True):
         st.session_state.data = None; st.rerun()
     if st.button("⟳ CLEAR CACHE", use_container_width=True):
         st.cache_data.clear(); st.session_state.data = None; st.rerun()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FILTER BY VIEW
-# ─────────────────────────────────────────────────────────────────────────────
+# ── FILTER ────────────────────────────────────────────────────────────────────
 if view == "📅 Single Day — 24H":
     view_data = data[data["datetime"].dt.date == sel_date].copy()
     t_sfx     = f"{sel_date} — 24H LMP"
@@ -258,16 +290,13 @@ else:
     t_sfx     = f"{min_date.strftime('%b %Y')} {'→ '+str(max_date) if n_days>1 else ''} — Daily Avg"
     x_lbl     = "Date"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BUS SELECTOR
-# ─────────────────────────────────────────────────────────────────────────────
+# ── BUS SELECTOR ──────────────────────────────────────────────────────────────
 all_buses = sorted(data["bus"].dropna().unique().tolist())
 pref      = [b for b in ["HB_HOUSTON","HB_NORTH","HB_SOUTH","HB_WEST",
                           "LZ_HOUSTON","LZ_NORTH","LZ_SOUTH","LZ_WEST"] if b in all_buses]
 default   = pref[:1] if pref else all_buses[:1]
 
 st.markdown('<div class="shdr">SELECT BUS / SETTLEMENT POINT</div>', unsafe_allow_html=True)
-
 c1, c2 = st.columns([3,1])
 with c1:
     sel = st.multiselect("", all_buses, default=default, max_selections=6,
@@ -281,22 +310,19 @@ if not sel:
 
 filt = view_data[view_data["bus"].isin(sel)].copy()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KPI CARDS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── KPI CARDS ─────────────────────────────────────────────────────────────────
 p     = filt[filt["bus"]==sel[0]].sort_values("datetime")
 c_lmp = float(p["lmp"].iloc[-1])  if not p.empty else 0
 d_avg = float(p["lmp"].mean())    if not p.empty else 0
 d_max = float(p["lmp"].max())     if not p.empty else 0
-d_min = float(p["lmp"].min())     if not p.empty else 0
 vstd  = float(p["lmp"].std())     if not p.empty else 0
 vlbl  = "LOW" if vstd<5 else ("HIGH" if vstd>15 else "MOD")
 pt    = p.loc[p["lmp"].idxmax(),"datetime"].strftime("%m-%d %H:%M") if not p.empty else "--"
 mid   = len(p)//2
 base  = p["lmp"].iloc[:mid].mean() if mid>0 and p["lmp"].iloc[:mid].mean()!=0 else 1
 dpct  = ((p["lmp"].iloc[mid:].mean()-base)/abs(base)*100) if mid>0 else 0
-bc = "bp" if dpct>=0 else "bn"
-vc = "bp" if vlbl=="LOW" else ("bn" if vlbl=="HIGH" else "bm")
+bc    = "bp" if dpct>=0 else "bn"
+vc    = "bp" if vlbl=="LOW" else ("bn" if vlbl=="HIGH" else "bm")
 
 k1,k2,k3,k4 = st.columns(4)
 with k1: st.markdown(f'<div class="card"><div class="lbl">⚡ LAST LMP</div><div class="val">${c_lmp:.2f}</div><div class="sub">MOST RECENT HOUR · $/MWh</div><span class="{bc}">{dpct:+.1f}%</span></div>',unsafe_allow_html=True)
@@ -305,9 +331,7 @@ with k3: st.markdown(f'<div class="card"><div class="lbl">▲ PEAK LMP</div><div
 with k4: st.markdown(f'<div class="card"><div class="lbl">≈ VOLATILITY</div><div class="val">{vstd:.1f}</div><div class="sub">STD DEV — {vlbl}</div><span class="{vc}">{vlbl}</span></div>',unsafe_allow_html=True)
 st.markdown("<br>",unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AGGREGATE FOR MONTHLY VIEW
-# ─────────────────────────────────────────────────────────────────────────────
+# ── AGGREGATE FOR MONTHLY ─────────────────────────────────────────────────────
 if view == "📆 Monthly Average":
     filt["day"] = filt["datetime"].dt.normalize()
     plot_df = filt.groupby(["day","bus"])["lmp"].agg(
@@ -316,9 +340,7 @@ if view == "📆 Monthly Average":
 else:
     plot_df = filt.copy()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHART
-# ─────────────────────────────────────────────────────────────────────────────
+# ── CHART ─────────────────────────────────────────────────────────────────────
 st.markdown(f'<div class="shdr">LMP PRICE CHART — {t_sfx}</div>', unsafe_allow_html=True)
 
 fig = go.Figure()
@@ -356,43 +378,30 @@ for i, bus in enumerate(sel):
 fig.add_shape(type="line", x0=0, x1=1, xref="paper", y0=0, y1=0,
               line=dict(color="rgba(0,255,153,0.15)", width=1, dash="dash"))
 fig.update_layout(
-    template="plotly_dark",
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="#020818",
-    height=500,
-    font=dict(family="Rajdhani", color="rgba(0,255,153,0.7)"),
-    legend=dict(orientation="h", y=1.06, x=0,
-                font=dict(size=12, color="#00ff99"),
+    template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#020818",
+    height=500, font=dict(family="Rajdhani", color="rgba(0,255,153,0.7)"),
+    legend=dict(orientation="h", y=1.06, x=0, font=dict(size=12, color="#00ff99"),
                 bgcolor="rgba(0,0,0,0)"),
-    xaxis=dict(
-        title=dict(text=x_lbl, font=dict(color="rgba(0,255,153,0.6)")),
-        showgrid=True, gridcolor="rgba(0,255,153,0.06)",
-        tickfont=dict(color="rgba(0,255,153,0.6)"),
-        rangeslider=dict(visible=True, bgcolor="#020818", thickness=0.04),
-        showline=True, linecolor="rgba(0,255,153,0.15)"),
-    yaxis=dict(
-        title=dict(text="LMP ($/MWh)", font=dict(color="rgba(0,255,153,0.6)")),
-        showgrid=True, gridcolor="rgba(0,255,153,0.06)",
-        tickprefix="$", tickfont=dict(color="rgba(0,255,153,0.6)"),
-        zeroline=False, showline=True,
-        linecolor="rgba(0,255,153,0.15)"),
-    hovermode="x unified",
-    margin=dict(l=60, r=15, t=50, b=40),
-    barmode="group")
+    xaxis=dict(title=dict(text=x_lbl, font=dict(color="rgba(0,255,153,0.6)")),
+               showgrid=True, gridcolor="rgba(0,255,153,0.06)",
+               tickfont=dict(color="rgba(0,255,153,0.6)"),
+               rangeslider=dict(visible=True, bgcolor="#020818", thickness=0.04),
+               showline=True, linecolor="rgba(0,255,153,0.15)"),
+    yaxis=dict(title=dict(text="LMP ($/MWh)", font=dict(color="rgba(0,255,153,0.6)")),
+               showgrid=True, gridcolor="rgba(0,255,153,0.06)",
+               tickprefix="$", tickfont=dict(color="rgba(0,255,153,0.6)"),
+               zeroline=False, showline=True, linecolor="rgba(0,255,153,0.15)"),
+    hovermode="x unified", margin=dict(l=60, r=15, t=50, b=40), barmode="group")
 st.plotly_chart(fig, use_container_width=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HOURLY TABLE — single day
-# ─────────────────────────────────────────────────────────────────────────────
+# ── HOURLY TABLE ──────────────────────────────────────────────────────────────
 if view == "📅 Single Day — 24H":
     with st.expander("🕐 HOURLY PRICE TABLE"):
         pivot = filt.pivot_table(index="datetime", columns="bus", values="lmp").round(2)
         pivot.index = pivot.index.strftime("%H:%M")
         st.dataframe(pivot, use_container_width=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SUMMARY TABLE — monthly
-# ─────────────────────────────────────────────────────────────────────────────
+# ── SUMMARY TABLE ─────────────────────────────────────────────────────────────
 if view == "📆 Monthly Average":
     st.markdown('<div class="shdr" style="margin-top:20px">PERIOD SUMMARY</div>', unsafe_allow_html=True)
     rows = [{"BUS":n,
@@ -405,9 +414,7 @@ if view == "📆 Monthly Average":
     if rows:
         st.dataframe(pd.DataFrame(rows).set_index("BUS"), use_container_width=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXPORT
-# ─────────────────────────────────────────────────────────────────────────────
+# ── EXPORT ────────────────────────────────────────────────────────────────────
 with st.expander("◈ RAW DATA EXPORT"):
     show = filt.sort_values("datetime", ascending=False)
     st.dataframe(show, use_container_width=True)
