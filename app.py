@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -7,6 +6,7 @@ from io import BytesIO
 import zipfile
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="ERCOT LMP", page_icon="⚡", layout="wide")
 
@@ -106,114 +106,65 @@ def parse_zip(file_bytes: bytes) -> pd.DataFrame:
 # BULK DOWNLOAD — ERCOT ARCHIVE (no API key needed)
 # ─────────────────────────────────────────────────────────────────────────────
 DOWNLOAD_BASE = "https://data.ercot.com"
-ARCHIVE_API   = "https://data.ercot.com/api/1/services/search/archive/downloadable-files"
-ARCHIVE_API2  = "https://data.ercot.com/api/1/services/search/archive"
 
-def get_archive_index(date_from: date, date_to: date) -> list:
-    """
-    Fetch list of NP4-183-CD zip download URLs from ERCOT.
-    Tries the new API structure first, falls back to scraping the archive page.
-    """
+def get_archive_index(date_from: date, date_to: date, api_key: str = "") -> list:
+    """Fetch zip links via ERCOT's public API using subscription key."""
+    import re
     all_files = []
+    hdrs = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Ocp-Apim-Subscription-Key": api_key,
+    }
 
-    # ── Strategy 1: New API (seen on network tab of data.ercot.com) ──────
-    new_api_urls = [
-        "https://data.ercot.com/api/1/services/search/archive/downloadable-files",
-        "https://data.ercot.com/api/1/services/search/archive",
-        "https://data.ercot.com/api/1/services/data-products/NP4-183-CD/files",
-        "https://data.ercot.com/api/1/services/data-products/np4-183-cd/files",
+    urls_to_try = [
+        f"https://api.ercot.com/api/public-reports/np4-183-cd/files",
+        f"https://api.ercot.com/api/public-reports/np4-183-cd",
+        f"https://api.ercot.com/api/public/np4-183-cd",
     ]
-    date_param_combos = [
-        {"startDate": str(date_from), "endDate": str(date_to)},
-        {"startDt":   str(date_from), "endDt":   str(date_to)},
-        {"fromDate":  str(date_from), "toDate":  str(date_to)},
-        {"deliveryDateFrom": str(date_from), "deliveryDateTo": str(date_to)},
-        {},  # no date filter — get all, filter afterwards
-    ]
-    hdrs = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 
-    for api_url in new_api_urls:
-        for date_params in date_param_combos:
-            params = {"toc_id": "NP4-183-CD", "size": 200, "page": 1, **date_params}
-            try:
-                r = requests.get(api_url, params=params, headers=hdrs, timeout=20)
-                if not r.ok or not r.text.strip().startswith("{"):
-                    continue
-                data  = r.json()
-                files = (data.get("data") or
-                         data.get("ListDocsByMktProductResponse", {}).get("ErcotDoc", []) or
-                         data.get("result", {}).get("ErcotDoc", []) or
-                         data.get("results", []) or [])
-                if isinstance(files, dict):
-                    files = [files]
-                if not files:
-                    continue
-                for f in files:
-                    url_path = (f.get("downloadURL") or f.get("url") or
-                                f.get("Document", {}).get("@Url") or "")
-                    name     = (f.get("friendlyName") or f.get("filename") or
-                                f.get("Document", {}).get("@FriendlyName") or
-                                url_path.split("/")[-1])
-                    if url_path:
-                        full_url = url_path if url_path.startswith("http") else DOWNLOAD_BASE + url_path
-                        all_files.append({"filename": name, "url": full_url})
-                if all_files:
-                    # filter by date if we got everything
-                    all_files = _filter_by_date(all_files, date_from, date_to)
-                    return all_files
-            except Exception:
+    for api_url in urls_to_try:
+        try:
+            params = {
+                "deliveryDateFrom": str(date_from),
+                "deliveryDateTo":   str(date_to),
+                "size": 200,
+                "page": 1,
+                "subscription-key": api_key,
+            }
+            r = requests.get(api_url, headers=hdrs, params=params, timeout=30)
+            if not r.ok or not r.text.strip().startswith("{"):
                 continue
-
-    # ── Strategy 2: Scrape the archive page HTML ─────────────────────────
-    from bs4 import BeautifulSoup
-    archive_url = f"https://data.ercot.com/data-product-archive/NP4-183-CD"
-    try:
-        r = requests.get(archive_url, headers=hdrs, timeout=30)
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if ".zip" in href.lower() or "download" in href.lower():
-                full_url = href if href.startswith("http") else DOWNLOAD_BASE + href
-                all_files.append({"filename": href.split("/")[-1], "url": full_url})
-        if all_files:
-            all_files = _filter_by_date(all_files, date_from, date_to)
-            return all_files
-    except Exception as e:
-        raise ValueError(f"Scrape failed: {e}")
+            data  = r.json()
+            files = data.get("data") or data.get("files") or data.get("results") or []
+            if not files:
+                continue
+            for f in files:
+                url_path = (f.get("downloadURL") or f.get("url") or f.get("link") or "")
+                name     = f.get("friendlyName") or f.get("filename") or url_path.split("/")[-1]
+                if url_path:
+                    full = url_path if url_path.startswith("http") else DOWNLOAD_BASE + url_path
+                    all_files.append({"filename": name, "url": full})
+            if all_files:
+                return all_files
+        except Exception:
+            continue
 
     raise ValueError(
-        "Could not find any download links from ERCOT.\n"
-        "The site may require a login or have changed structure.\n"
-        "Please use the 📁 Upload ZIP tab instead."
+        "Could not retrieve file list from ERCOT.\n\n"
+        "**Root cause:** The archive page uses JavaScript to load files, "
+        "which can't be scraped server-side.\n\n"
+        "**Fix:** Enter your API key in the field below to pull files directly."
     )
-
-
-def _filter_by_date(files: list, date_from: date, date_to: date) -> list:
-    """Keep only files whose filename contains a date in the range."""
-    import re
-    filtered = []
-    for f in files:
-        # filenames like: NP4-183-CD_20240301.zip or 2024-03-01_NP4-183...
-        match = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})", f["filename"])
-        if match:
-            try:
-                fdate = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-                if date_from <= fdate <= date_to:
-                    filtered.append(f)
-            except ValueError:
-                filtered.append(f)  # keep if date parse fails
-        else:
-            filtered.append(f)  # keep if no date in filename
-    return filtered
 
 def download_and_parse(file_info: dict) -> pd.DataFrame:
     r = requests.get(file_info["url"], timeout=60)
     r.raise_for_status()
     return parse_zip(r.content)
 
-def bulk_fetch(date_from: date, date_to: date) -> pd.DataFrame:
+def bulk_fetch(date_from: date, date_to: date, api_key: str = "") -> pd.DataFrame:
     st.info(f"🔍 Scanning ERCOT archive: {date_from} → {date_to}...")
-    files = get_archive_index(date_from, date_to)
+    files = get_archive_index(date_from, date_to, api_key)
     if not files:
         raise ValueError("No files found for this date range. Try adjusting your dates.")
     st.success(f"📦 Found **{len(files)}** zip files — downloading now...")
@@ -297,17 +248,25 @@ if st.session_state.data is None:
         n_months = max((year_to - year_from) * 12 + (month_to - month_from) + 1, 0)
         st.caption(f"📆 {n_months} month(s) selected · approx {n_months * 30} zip files · est. {max(n_months * 2, 1)} min download time")
 
+        api_key = st.text_input("🔑 API Key (required for bulk download)",
+                                 type="password",
+                                 placeholder="69dc2329959147e98eff168605575938",
+                                 help="Your Ocp-Apim-Subscription-Key from developer.ercot.com")
+
         if d_from > d_to:
             st.error("'From' date must be before 'To' date.")
         else:
             if st.button("⚡ DOWNLOAD ALL FROM ERCOT", use_container_width=True):
-                try:
-                    df = bulk_fetch(d_from, d_to)
-                    st.session_state.data = df
-                    st.success(f"✅ {len(df):,} records | {df['bus'].nunique()} buses | {d_from} → {d_to}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ {e}")
+                if not api_key:
+                    st.error("Please enter your API key.")
+                else:
+                    try:
+                        df = bulk_fetch(d_from, d_to, api_key)
+                        st.session_state.data = df
+                        st.success(f"✅ {len(df):,} records | {df['bus'].nunique()} buses | {d_from} → {d_to}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ {e}")
 
     st.stop()
 
