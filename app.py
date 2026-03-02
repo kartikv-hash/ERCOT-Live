@@ -1,12 +1,12 @@
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime, timedelta, date
+from datetime import date, timedelta
 from io import BytesIO
 import zipfile
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="ERCOT LMP", page_icon="⚡", layout="wide")
 
@@ -59,75 +59,11 @@ def rgba(h, a=0.15):
     return f"rgba({int(h[:2],16)},{int(h[2:4],16)},{int(h[4:],16)},{a})"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ERCOT API FETCH
+# PARSE / NORMALIZE
 # ─────────────────────────────────────────────────────────────────────────────
-BASE_URL = "https://api.ercot.com/api/public-reports/np4-183-cd"
-
-def fetch_ercot(api_key: str, date_from: str, date_to: str, page_size: int = 200) -> pd.DataFrame:
-    """Fetch NP4-183-CD from ERCOT API and return a clean DataFrame."""
-    headers = {
-        "Ocp-Apim-Subscription-Key": api_key,
-        "Accept": "application/json",
-    }
-    all_records = []
-    page = 1
-
-    prog = st.progress(0, text="⚡ Fetching from ERCOT API...")
-    while True:
-        params = {
-            "deliveryDateFrom": date_from,
-            "deliveryDateTo":   date_to,
-            "size": page_size,
-            "page": page,
-        }
-        r = requests.get(BASE_URL, headers=headers, params=params, timeout=30)
-        if not r.ok:
-            prog.empty()
-            raise ValueError(f"API error {r.status_code}: {r.text[:300]}")
-
-        data = r.json()
-        records = data.get("data", [])
-        if not records:
-            break
-
-        all_records.extend(records)
-        total = data.get("totalCount", len(all_records))
-        pct   = min(len(all_records) / max(total, 1), 1.0)
-        prog.progress(pct, text=f"⚡ {len(all_records):,} / {total:,} records...")
-
-        if len(all_records) >= total:
-            break
-        page += 1
-
-    prog.empty()
-
-    if not all_records:
-        raise ValueError("API returned 0 records for the selected date range.")
-
-    df = pd.DataFrame(all_records)
-    return normalize_df(df)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PARSE ZIP → DATAFRAME
-# ─────────────────────────────────────────────────────────────────────────────
-def parse_zip(file_bytes: bytes) -> pd.DataFrame:
-    with zipfile.ZipFile(BytesIO(file_bytes)) as z:
-        csvs = [f for f in z.namelist() if f.lower().endswith(".csv")]
-        if not csvs:
-            raise ValueError(f"No CSV in zip. Files: {z.namelist()}")
-        with z.open(csvs[0]) as f:
-            raw   = f.read().decode("utf-8", errors="replace")
-            lines = [l for l in raw.splitlines() if not l.startswith("#")]
-            df    = pd.read_csv(BytesIO("\n".join(lines).encode()), low_memory=False)
-    return normalize_df(df)
-
-
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize columns and build datetime — works for both API JSON and CSV."""
     df.columns = [c.strip() for c in df.columns]
     col_lower  = {c: c.lower().replace(" ","").replace("_","") for c in df.columns}
-
     rename = {}
     for orig, cl in col_lower.items():
         if   any(x in cl for x in ["busname","settlementpoint","nodename","bus"]):
@@ -140,35 +76,113 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
             rename[orig] = "lmp"
         elif any(x in cl for x in ["settlementpointprice","settlepointprice","spp","price","lmp"]):
             if "lmp" not in rename.values(): rename[orig] = "lmp"
-
     df = df.rename(columns=rename)
-
     if "lmp" not in df.columns:
-        raise ValueError(f"Cannot find LMP price column. Columns: {list(df.columns)}")
+        raise ValueError(f"Cannot find LMP column. Got: {list(df.columns)}")
     if "bus" not in df.columns:
-        raise ValueError(f"Cannot find Bus/Node column. Columns: {list(df.columns)}")
-
+        raise ValueError(f"Cannot find Bus column. Got: {list(df.columns)}")
     df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce")
-
     if "date" in df.columns and "hour" in df.columns:
-        hr_str = df["hour"].astype(str).str.replace(":00","").str.strip()
-        hr     = pd.to_numeric(hr_str, errors="coerce").fillna(1)
-        df["datetime"] = pd.to_datetime(df["date"], errors="coerce") + \
-                         pd.to_timedelta(hr - 1, unit="h")
+        hr = pd.to_numeric(df["hour"].astype(str).str.replace(":00","").str.strip(), errors="coerce").fillna(1)
+        df["datetime"] = pd.to_datetime(df["date"], errors="coerce") + pd.to_timedelta(hr - 1, unit="h")
     elif "date" in df.columns:
         df["datetime"] = pd.to_datetime(df["date"], errors="coerce")
     else:
-        raise ValueError(f"Cannot find date column. Columns: {list(df.columns)}")
-
+        raise ValueError(f"Cannot find date column. Got: {list(df.columns)}")
     return df[["datetime","bus","lmp"]].dropna().sort_values("datetime")
 
+def parse_zip(file_bytes: bytes) -> pd.DataFrame:
+    with zipfile.ZipFile(BytesIO(file_bytes)) as z:
+        csvs = [f for f in z.namelist() if f.lower().endswith(".csv")]
+        if not csvs:
+            raise ValueError(f"No CSV in zip. Files: {z.namelist()}")
+        with z.open(csvs[0]) as f:
+            raw   = f.read().decode("utf-8", errors="replace")
+            lines = [l for l in raw.splitlines() if not l.startswith("#")]
+            df    = pd.read_csv(BytesIO("\n".join(lines).encode()), low_memory=False)
+    return normalize_df(df)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BULK DOWNLOAD — ERCOT ARCHIVE (no API key needed)
+# ─────────────────────────────────────────────────────────────────────────────
+ARCHIVE_URL   = "https://data.ercot.com/api/1/services/search/archive/downloadable-files"
+DOWNLOAD_BASE = "https://data.ercot.com"
+
+def get_archive_index(date_from: date, date_to: date) -> list:
+    all_files = []
+    page = 1
+    while True:
+        params = {
+            "toc_id":    "NP4-183-CD",
+            "startDate": date_from.strftime("%Y-%m-%d"),
+            "endDate":   date_to.strftime("%Y-%m-%d"),
+            "size":      100,
+            "page":      page,
+            "sortBy":    "postDatetime",
+            "sortOrder": "DESC",
+        }
+        r = requests.get(ARCHIVE_URL, params=params, timeout=30)
+        if not r.ok:
+            raise ValueError(f"Archive index error {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        files = (data.get("data") or
+                 data.get("ListDocsByMktProductResponse", {}).get("ErcotDoc", []) or
+                 data.get("result", {}).get("ErcotDoc", []) or [])
+        if isinstance(files, dict):
+            files = [files]
+        if not files:
+            break
+        for f in files:
+            url_path = (f.get("downloadURL") or f.get("url") or
+                        f.get("Document", {}).get("@Url") or "")
+            name     = (f.get("friendlyName") or f.get("filename") or
+                        f.get("Document", {}).get("@FriendlyName") or url_path.split("/")[-1])
+            if url_path:
+                all_files.append({
+                    "filename": name,
+                    "url": url_path if url_path.startswith("http") else DOWNLOAD_BASE + url_path,
+                })
+        total = int(data.get("totalCount") or data.get("total") or len(all_files))
+        if len(all_files) >= total:
+            break
+        page += 1
+    return all_files
+
+def download_and_parse(file_info: dict) -> pd.DataFrame:
+    r = requests.get(file_info["url"], timeout=60)
+    r.raise_for_status()
+    return parse_zip(r.content)
+
+def bulk_fetch(date_from: date, date_to: date) -> pd.DataFrame:
+    st.info(f"🔍 Scanning ERCOT archive: {date_from} → {date_to}...")
+    files = get_archive_index(date_from, date_to)
+    if not files:
+        raise ValueError("No files found for this date range. Try adjusting your dates.")
+    st.success(f"📦 Found **{len(files)}** zip files — downloading now...")
+    prog = st.progress(0, text="⚡ Starting downloads...")
+    done, dfs, fails = 0, [], []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(download_and_parse, f): f for f in files}
+        for future in as_completed(futures):
+            f = futures[future]
+            done += 1
+            prog.progress(done / len(files), text=f"⚡ {done}/{len(files)} — {f['filename']}")
+            try:
+                dfs.append(future.result())
+            except Exception as e:
+                fails.append(f"{f['filename']}: {e}")
+    prog.empty()
+    if fails:
+        st.warning(f"⚠️ {len(fails)} file(s) failed:\n" + "\n".join(fails[:5]))
+    if not dfs:
+        raise ValueError("All downloads failed.")
+    return pd.concat(dfs, ignore_index=True).sort_values("datetime")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
-for key in ["data", "api_key"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
+if "data" not in st.session_state:
+    st.session_state.data = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER
@@ -180,40 +194,13 @@ st.markdown('<div class="subtitle">Day-Ahead Market // Locational Marginal Price
 # LOAD DATA SECTION
 # ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.data is None:
-    tab_api, tab_zip = st.tabs(["🔑 API (Live Pull)", "📁 Upload ZIP"])
 
-    # ── API TAB ───────────────────────────────────────────────────────────
-    with tab_api:
-        st.markdown('<div class="shdr">ERCOT API — NP4-183-CD</div>', unsafe_allow_html=True)
-        api_key   = st.text_input("API Subscription Key", type="password",
-                                   value=st.session_state.api_key or "",
-                                   placeholder="Ocp-Apim-Subscription-Key")
-        c1, c2 = st.columns(2)
-        with c1:
-            d_from = st.date_input("Date From", value=date.today() - timedelta(days=1))
-        with c2:
-            d_to   = st.date_input("Date To",   value=date.today() - timedelta(days=1))
-
-        if st.button("⚡ FETCH FROM ERCOT API", use_container_width=True):
-            if not api_key:
-                st.error("Enter your API key.")
-            elif d_from > d_to:
-                st.error("Date From must be ≤ Date To.")
-            else:
-                try:
-                    df = fetch_ercot(api_key, str(d_from), str(d_to))
-                    st.session_state.data    = df
-                    st.session_state.api_key = api_key
-                    st.success(f"✅ {len(df):,} records | {df['bus'].nunique()} buses | {d_from} → {d_to}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ {e}")
+    tab_zip, tab_bulk = st.tabs(["📁 Upload ZIP", "📅 Bulk Download (Years of Data)"])
 
     # ── ZIP TAB ───────────────────────────────────────────────────────────
     with tab_zip:
         st.markdown('<div class="shdr">UPLOAD NP4-183-CD ZIP FILE(S)</div>', unsafe_allow_html=True)
-        ups = st.file_uploader("DROP ZIP FILE(S) HERE", type="zip",
-                                accept_multiple_files=True)
+        ups = st.file_uploader("DROP ZIP FILE(S) HERE", type="zip", accept_multiple_files=True)
         if ups:
             all_dfs = []
             pb = st.progress(0, text="⚡ Parsing files...")
@@ -230,6 +217,40 @@ if st.session_state.data is None:
                 st.session_state.data = pd.concat(all_dfs, ignore_index=True)
                 st.rerun()
 
+    # ── BULK TAB ──────────────────────────────────────────────────────────
+    with tab_bulk:
+        st.markdown('<div class="shdr">BULK DOWNLOAD — ERCOT ARCHIVE</div>', unsafe_allow_html=True)
+        st.caption("Pulls directly from data.ercot.com — no API key needed")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            year_from  = st.selectbox("From Year",  list(range(2010, date.today().year + 1))[::-1], index=2)
+            month_from = st.selectbox("From Month", list(range(1, 13)), index=0,
+                                       format_func=lambda m: date(2000, m, 1).strftime("%B"))
+        with col2:
+            year_to    = st.selectbox("To Year",   list(range(2010, date.today().year + 1))[::-1], index=0)
+            month_to   = st.selectbox("To Month",  list(range(1, 13)), index=date.today().month - 2,
+                                       format_func=lambda m: date(2000, m, 1).strftime("%B"))
+
+        d_from = date(year_from, month_from, 1)
+        d_to   = date(year_to, month_to,
+                      pd.Timestamp(year_to, month_to, 1).days_in_month)
+
+        n_months = max((year_to - year_from) * 12 + (month_to - month_from) + 1, 0)
+        st.caption(f"📆 {n_months} month(s) selected · approx {n_months * 30} zip files · est. {max(n_months * 2, 1)} min download time")
+
+        if d_from > d_to:
+            st.error("'From' date must be before 'To' date.")
+        else:
+            if st.button("⚡ DOWNLOAD ALL FROM ERCOT", use_container_width=True):
+                try:
+                    df = bulk_fetch(d_from, d_to)
+                    st.session_state.data = df
+                    st.success(f"✅ {len(df):,} records | {df['bus'].nunique()} buses | {d_from} → {d_to}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -240,7 +261,6 @@ min_date = data["datetime"].dt.date.min()
 max_date = data["datetime"].dt.date.max()
 n_days   = (max_date - min_date).days + 1
 
-# ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="title-glow" style="font-size:16px">⚡ ERCOT LMP</div>', unsafe_allow_html=True)
     st.markdown(f'<div style="font-size:9px;color:#00ff9930;letter-spacing:2px;margin-bottom:12px">DATA: {min_date} → {max_date}<br>{len(data):,} RECORDS LOADED</div>', unsafe_allow_html=True)
@@ -260,21 +280,6 @@ with st.sidebar:
     ma_w    = st.slider("MA Window", 2, 14, 3) if show_ma else 3
 
     st.markdown("---")
-
-    # Re-fetch with API key if available
-    if st.session_state.api_key:
-        st.markdown('<div class="shdr" style="margin-bottom:8px">FETCH NEW DATE RANGE</div>', unsafe_allow_html=True)
-        rf_from = st.date_input("From", value=min_date, key="rf_from")
-        rf_to   = st.date_input("To",   value=max_date, key="rf_to")
-        if st.button("⚡ REFETCH API", use_container_width=True):
-            try:
-                df = fetch_ercot(st.session_state.api_key, str(rf_from), str(rf_to))
-                st.session_state.data = df
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
-        st.markdown("---")
-
     if st.button("📂 LOAD NEW FILES", use_container_width=True):
         st.session_state.data = None; st.rerun()
     if st.button("⟳ CLEAR CACHE", use_container_width=True):
@@ -283,12 +288,11 @@ with st.sidebar:
 # ── FILTER ────────────────────────────────────────────────────────────────────
 if view == "📅 Single Day — 24H":
     view_data = data[data["datetime"].dt.date == sel_date].copy()
-    t_sfx     = f"{sel_date} — 24H LMP"
-    x_lbl     = "Hour (CST)"
+    t_sfx, x_lbl = f"{sel_date} — 24H LMP", "Hour (CST)"
 else:
     view_data = data.copy()
-    t_sfx     = f"{min_date.strftime('%b %Y')} {'→ '+str(max_date) if n_days>1 else ''} — Daily Avg"
-    x_lbl     = "Date"
+    t_sfx = f"{min_date.strftime('%b %Y')} {'→ '+str(max_date) if n_days>1 else ''} — Daily Avg"
+    x_lbl = "Date"
 
 # ── BUS SELECTOR ──────────────────────────────────────────────────────────────
 all_buses = sorted(data["bus"].dropna().unique().tolist())
@@ -299,8 +303,7 @@ default   = pref[:1] if pref else all_buses[:1]
 st.markdown('<div class="shdr">SELECT BUS / SETTLEMENT POINT</div>', unsafe_allow_html=True)
 c1, c2 = st.columns([3,1])
 with c1:
-    sel = st.multiselect("", all_buses, default=default, max_selections=6,
-                          label_visibility="collapsed")
+    sel = st.multiselect("", all_buses, default=default, max_selections=6, label_visibility="collapsed")
 with c2:
     st.markdown(f'<div style="font-size:10px;color:#00ff9950;padding-top:8px">{len(all_buses)} buses available<br>{min_date} → {max_date}</div>', unsafe_allow_html=True)
 
@@ -331,86 +334,64 @@ with k3: st.markdown(f'<div class="card"><div class="lbl">▲ PEAK LMP</div><div
 with k4: st.markdown(f'<div class="card"><div class="lbl">≈ VOLATILITY</div><div class="val">{vstd:.1f}</div><div class="sub">STD DEV — {vlbl}</div><span class="{vc}">{vlbl}</span></div>',unsafe_allow_html=True)
 st.markdown("<br>",unsafe_allow_html=True)
 
-# ── AGGREGATE FOR MONTHLY ─────────────────────────────────────────────────────
+# ── AGGREGATE ─────────────────────────────────────────────────────────────────
 if view == "📆 Monthly Average":
     filt["day"] = filt["datetime"].dt.normalize()
-    plot_df = filt.groupby(["day","bus"])["lmp"].agg(
-        lmp="mean", lmp_max="max", lmp_min="min"
-    ).reset_index().rename(columns={"day":"datetime"})
+    plot_df = filt.groupby(["day","bus"])["lmp"].agg(lmp="mean",lmp_max="max",lmp_min="min").reset_index().rename(columns={"day":"datetime"})
 else:
     plot_df = filt.copy()
 
 # ── CHART ─────────────────────────────────────────────────────────────────────
 st.markdown(f'<div class="shdr">LMP PRICE CHART — {t_sfx}</div>', unsafe_allow_html=True)
-
 fig = go.Figure()
 for i, bus in enumerate(sel):
     c   = COLORS[i % len(COLORS)]
     bdf = plot_df[plot_df["bus"]==bus].sort_values("datetime")
     if bdf.empty: continue
-
     if "lmp_max" in bdf.columns:
         fig.add_trace(go.Scatter(
             x=pd.concat([bdf["datetime"], bdf["datetime"][::-1]]),
             y=pd.concat([bdf["lmp_max"],  bdf["lmp_min"][::-1]]),
-            fill="toself", fillcolor=rgba(c, 0.07),
-            line=dict(color="rgba(0,0,0,0)"),
-            showlegend=False, hoverinfo="skip"))
-
+            fill="toself", fillcolor=rgba(c,0.07),
+            line=dict(color="rgba(0,0,0,0)"), showlegend=False, hoverinfo="skip"))
     ht = f"<b>{bus}</b><br>%{{x}}<br><b>${{y:.2f}}/MWh</b><extra></extra>"
     if chart_t == "Bar":
-        fig.add_trace(go.Bar(x=bdf["datetime"], y=bdf["lmp"], name=bus,
-            marker_color=c, opacity=0.8, hovertemplate=ht))
+        fig.add_trace(go.Bar(x=bdf["datetime"],y=bdf["lmp"],name=bus,marker_color=c,opacity=0.8,hovertemplate=ht))
     elif chart_t == "Area":
-        fig.add_trace(go.Scatter(x=bdf["datetime"], y=bdf["lmp"], name=bus,
-            mode="lines", line=dict(color=c, width=2),
-            fill="tozeroy", fillcolor=rgba(c, 0.12), hovertemplate=ht))
+        fig.add_trace(go.Scatter(x=bdf["datetime"],y=bdf["lmp"],name=bus,mode="lines",line=dict(color=c,width=2),fill="tozeroy",fillcolor=rgba(c,0.12),hovertemplate=ht))
     else:
-        fig.add_trace(go.Scatter(x=bdf["datetime"], y=bdf["lmp"], name=bus,
-            mode="lines", line=dict(color=c, width=2), hovertemplate=ht))
-
+        fig.add_trace(go.Scatter(x=bdf["datetime"],y=bdf["lmp"],name=bus,mode="lines",line=dict(color=c,width=2),hovertemplate=ht))
     if show_ma and len(bdf) >= ma_w:
-        ma = bdf["lmp"].rolling(ma_w, min_periods=1).mean()
-        fig.add_trace(go.Scatter(x=bdf["datetime"], y=ma, name=f"{bus} MA{ma_w}",
-            mode="lines", line=dict(color=c, width=1, dash="dot"),
-            hovertemplate=f"MA $%{{y:.2f}}<extra></extra>"))
+        ma = bdf["lmp"].rolling(ma_w,min_periods=1).mean()
+        fig.add_trace(go.Scatter(x=bdf["datetime"],y=ma,name=f"{bus} MA{ma_w}",mode="lines",line=dict(color=c,width=1,dash="dot"),hovertemplate=f"MA $%{{y:.2f}}<extra></extra>"))
 
-fig.add_shape(type="line", x0=0, x1=1, xref="paper", y0=0, y1=0,
-              line=dict(color="rgba(0,255,153,0.15)", width=1, dash="dash"))
+fig.add_shape(type="line",x0=0,x1=1,xref="paper",y0=0,y1=0,line=dict(color="rgba(0,255,153,0.15)",width=1,dash="dash"))
 fig.update_layout(
-    template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#020818",
-    height=500, font=dict(family="Rajdhani", color="rgba(0,255,153,0.7)"),
-    legend=dict(orientation="h", y=1.06, x=0, font=dict(size=12, color="#00ff99"),
-                bgcolor="rgba(0,0,0,0)"),
-    xaxis=dict(title=dict(text=x_lbl, font=dict(color="rgba(0,255,153,0.6)")),
-               showgrid=True, gridcolor="rgba(0,255,153,0.06)",
-               tickfont=dict(color="rgba(0,255,153,0.6)"),
-               rangeslider=dict(visible=True, bgcolor="#020818", thickness=0.04),
-               showline=True, linecolor="rgba(0,255,153,0.15)"),
-    yaxis=dict(title=dict(text="LMP ($/MWh)", font=dict(color="rgba(0,255,153,0.6)")),
-               showgrid=True, gridcolor="rgba(0,255,153,0.06)",
-               tickprefix="$", tickfont=dict(color="rgba(0,255,153,0.6)"),
-               zeroline=False, showline=True, linecolor="rgba(0,255,153,0.15)"),
-    hovermode="x unified", margin=dict(l=60, r=15, t=50, b=40), barmode="group")
+    template="plotly_dark",paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="#020818",height=500,
+    font=dict(family="Rajdhani",color="rgba(0,255,153,0.7)"),
+    legend=dict(orientation="h",y=1.06,x=0,font=dict(size=12,color="#00ff99"),bgcolor="rgba(0,0,0,0)"),
+    xaxis=dict(title=dict(text=x_lbl,font=dict(color="rgba(0,255,153,0.6)")),showgrid=True,gridcolor="rgba(0,255,153,0.06)",
+               tickfont=dict(color="rgba(0,255,153,0.6)"),rangeslider=dict(visible=True,bgcolor="#020818",thickness=0.04),
+               showline=True,linecolor="rgba(0,255,153,0.15)"),
+    yaxis=dict(title=dict(text="LMP ($/MWh)",font=dict(color="rgba(0,255,153,0.6)")),showgrid=True,gridcolor="rgba(0,255,153,0.06)",
+               tickprefix="$",tickfont=dict(color="rgba(0,255,153,0.6)"),zeroline=False,showline=True,linecolor="rgba(0,255,153,0.15)"),
+    hovermode="x unified",margin=dict(l=60,r=15,t=50,b=40),barmode="group")
 st.plotly_chart(fig, use_container_width=True)
 
-# ── HOURLY TABLE ──────────────────────────────────────────────────────────────
+# ── TABLES ────────────────────────────────────────────────────────────────────
 if view == "📅 Single Day — 24H":
     with st.expander("🕐 HOURLY PRICE TABLE"):
-        pivot = filt.pivot_table(index="datetime", columns="bus", values="lmp").round(2)
+        pivot = filt.pivot_table(index="datetime",columns="bus",values="lmp").round(2)
         pivot.index = pivot.index.strftime("%H:%M")
         st.dataframe(pivot, use_container_width=True)
 
-# ── SUMMARY TABLE ─────────────────────────────────────────────────────────────
 if view == "📆 Monthly Average":
     st.markdown('<div class="shdr" style="margin-top:20px">PERIOD SUMMARY</div>', unsafe_allow_html=True)
-    rows = [{"BUS":n,
-             "AVG $/MWh": round(filt[filt["bus"]==n]["lmp"].mean(),2),
-             "MAX":       round(filt[filt["bus"]==n]["lmp"].max(), 2),
-             "MIN":       round(filt[filt["bus"]==n]["lmp"].min(), 2),
-             "STD DEV":   round(filt[filt["bus"]==n]["lmp"].std(), 2),
-             "HOURS":     len(filt[filt["bus"]==n])}
-            for n in sel if not filt[filt["bus"]==n].empty]
+    rows = [{"BUS":n,"AVG $/MWh":round(filt[filt["bus"]==n]["lmp"].mean(),2),
+             "MAX":round(filt[filt["bus"]==n]["lmp"].max(),2),
+             "MIN":round(filt[filt["bus"]==n]["lmp"].min(),2),
+             "STD DEV":round(filt[filt["bus"]==n]["lmp"].std(),2),
+             "HOURS":len(filt[filt["bus"]==n])} for n in sel if not filt[filt["bus"]==n].empty]
     if rows:
         st.dataframe(pd.DataFrame(rows).set_index("BUS"), use_container_width=True)
 
@@ -418,8 +399,7 @@ if view == "📆 Monthly Average":
 with st.expander("◈ RAW DATA EXPORT"):
     show = filt.sort_values("datetime", ascending=False)
     st.dataframe(show, use_container_width=True)
-    st.download_button("⬇ DOWNLOAD CSV",
-        show.to_csv(index=False).encode(),
-        "ercot_lmp.csv", "text/csv", use_container_width=True)
+    st.download_button("⬇ DOWNLOAD CSV", show.to_csv(index=False).encode(),
+                       "ercot_lmp.csv","text/csv",use_container_width=True)
 
 st.markdown('<div style="font-size:10px;color:#00ff9915;text-align:center;margin-top:20px;letter-spacing:2px">ERCOT NP4-183-CD // DAM HOURLY LMP // data.ercot.com</div>', unsafe_allow_html=True)
