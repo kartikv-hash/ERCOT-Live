@@ -1,36 +1,27 @@
 import streamlit as st
 import requests
 
-st.set_page_config(page_title="ERCOT Debug", page_icon="⚡")
-st.title("⚡ ERCOT API Debugger")
+st.title("ERCOT API Debug")
 
-api_key = st.text_input("API Key", value="69dc2329959147e98eff168605575938", type="password")
+if st.button("Test"):
+    hdrs = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Referer": "https://data.ercot.com/",
+        "Origin": "https://data.ercot.com",
+    }
 
-URLS = [
-    "https://api.ercot.com/api/public-reports/np4-183-cd",
-    "https://api.ercot.com/api/public-reports/NP4-183-CD",
-    "https://api.ercot.com/api/public/np4-183-cd",
-    "https://api.ercot.com/api/public/NP4-183-CD",
-    "https://api.ercot.com/api/public-reports",
-    "https://api.ercot.com/api/public-reports/dam/hourly/lmp",
-    "https://api.ercot.com/api/public-reports/da-hrl-lmp",
-]
+    urls = [
+        "https://data.ercot.com/api/1/services/search/archive/downloadable-files?toc_id=NP4-183-CD&size=3",
+        "https://data.ercot.com/api/1/services/search/archive/downloadable-files?toc_id=NP4-183-CD&size=3&startDate=2026-02-01&endDate=2026-02-28",
+        "https://data.ercot.com/api/1/services/search/archive?toc_id=NP4-183-CD&size=3",
+        "https://data.ercot.com/api/1/action/datastore_search?resource_id=NP4-183-CD&limit=3",
+    ]
 
-if st.button("🔍 TEST ALL"):
-    for url in URLS:
-        for key_method, headers, params in [
-            ("header",      {"Ocp-Apim-Subscription-Key": api_key}, {}),
-            ("query param", {},                                      {"subscription-key": api_key}),
-        ]:
-            try:
-                r = requests.get(url, headers=headers,
-                                 params={"size": 1, **params}, timeout=10)
-                color = "green" if r.ok else "red"
-                st.markdown(f"**{r.status_code}** `{url}` via *{key_method}*")
-                if r.ok:
-                    st.success(r.text[:500])
-                    st.stop()
-                else:
-                    st.error(r.text[:300])
-            except Exception as e:
-                st.error(f"❌ {url} — {e}")
+    for url in urls:
+        try:
+            r = requests.get(url, headers=hdrs, timeout=15)
+            st.markdown(f"**{r.status_code}** `{url}`")
+            st.code(r.text[:500])
+        except Exception as e:
+            st.error(f"{url} → {e}")
