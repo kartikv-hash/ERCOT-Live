@@ -25,7 +25,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── ERCOT API Config ───────────────────────────────────────────────────────────
-BASE_URL = "https://api.ercot.com/api/public-reports/np6-785-er/spp_node_zone_hub"
+BASE_URL = "https://api.ercot.com/api/public-reports/np6-785-er/spp_node_zone_hub_da_lmp"
 HEADERS = {
     "Accept": "application/json",
     "Ocp-Apim-Subscription-Key": st.secrets.get("ERCOT_API_KEY", "")
@@ -173,7 +173,7 @@ for i, node in enumerate(selected_nodes):
         fig.add_trace(go.Scatter(
             x=node_df["datetime"], y=node_df["lmp"],
             name=node, mode="lines", line=dict(color=color, width=2),
-            fill="tozeroy", fillcolor=color.replace("ff","33").replace("#","rgba(").replace("33","0.15)") if "#" in color else color,
+            fill="tozeroy", fillcolor=f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},0.15)",
             hovertemplate=f"<b>{node}</b><br>%{{x|%Y-%m-%d}}<br>${{y:.2f}}/MWh<extra></extra>"
         ))
     elif chart_type == "Line":
