@@ -354,7 +354,7 @@ for i, bus in enumerate(sel):
             mode="lines", line=dict(color=c, width=1, dash="dot"),
             hovertemplate=f"MA $%{{y:.2f}}<extra></extra>"))
 
-fig.add_hline(y=0, line_dash="dash", line_color="#00ff9920", line_width=1)
+fig.add_hline(y=0, line_dash="dash", line_color="rgba(0,255,153,0.12)", line_width=1)
 fig.update_layout(
     template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="#020818", height=500,
