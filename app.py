@@ -57,29 +57,25 @@ def get_token(username: str, password: str) -> str:
 
 # ── Fetch LMP ──────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=180, show_spinner=False)
-def fetch_lmp(bus, d_from, d_to, token, sub_key) -> pd.DataFrame:
-    r = requests.get(DAM_URL,
-        headers={"Authorization":f"Bearer {token}",
-                 "Ocp-Apim-Subscription-Key": sub_key,
-                 "Accept":"application/json"},
-        params={"busName":bus,"deliveryDateFrom":d_from,"deliveryDateTo":d_to,"size":9999},
-        timeout=20)
+def fetch_lmp(bus, d_from, d_to, sub_key) -> pd.DataFrame:
+    params = {"busName":bus,"deliveryDateFrom":d_from,"deliveryDateTo":d_to,"size":9999,
+              "subscription-key": sub_key}
+    r = requests.get(DAM_URL, headers={"Accept":"application/json"}, params=params, timeout=20)
     r.raise_for_status()
-    raw    = r.json()
-    fields = [f["name"] for f in raw.get("fields",[])]
-    data   = raw.get("data",{})
-    rows   = data if isinstance(data,list) else data.get("rows",[])
+    raw=r.json()
+    fields=[f["name"] for f in raw.get("fields",[])]
+    data=raw.get("data",{}); rows=data if isinstance(data,list) else data.get("rows",[])
     if not rows: return pd.DataFrame()
-    df = pd.DataFrame(rows,columns=fields) if (fields and isinstance(rows[0],list)) else pd.DataFrame(rows)
-    df.columns = [c.lower() for c in df.columns]
-    dc = next((c for c in df.columns if "deliverydate" in c),None)
-    hc = next((c for c in df.columns if "hour" in c),None)
-    lc = next((c for c in df.columns if "lmp" in c),None)
+    df=pd.DataFrame(rows,columns=fields) if (fields and isinstance(rows[0],list)) else pd.DataFrame(rows)
+    df.columns=[c.lower() for c in df.columns]
+    dc=next((c for c in df.columns if "deliverydate" in c),None)
+    hc=next((c for c in df.columns if "hour" in c),None)
+    lc=next((c for c in df.columns if "lmp" in c),None)
     if not dc or not lc: return pd.DataFrame()
-    df["lmp"]      = pd.to_numeric(df[lc],errors="coerce")
-    df["datetime"] = pd.to_datetime(df[dc]) + pd.to_timedelta(
-        pd.to_numeric(df[hc],errors="coerce").fillna(1)-1 if hc else 0, unit="h")
-    df["node"] = bus
+    df["lmp"]=pd.to_numeric(df[lc],errors="coerce")
+    df["datetime"]=pd.to_datetime(df[dc])+pd.to_timedelta(
+        pd.to_numeric(df[hc],errors="coerce").fillna(1)-1 if hc else 0,unit="h")
+    df["node"]=bus
     return df[["datetime","lmp","node"]].dropna().sort_values("datetime")
 
 # ── Demo data ──────────────────────────────────────────────────────────────────
@@ -151,23 +147,16 @@ with c2:
     if st.button("🔄 Refresh",use_container_width=True): st.cache_data.clear(); st.rerun()
 
 token=None; using_demo=True
-if sub_key and username and password:
-    try:
-        with st.spinner("🔐 Authenticating with ERCOT..."):
-            token=get_token(username, password)
-        using_demo=False
-        st.success("🟢 Authenticated — pulling live ERCOT data")
-    except Exception as e:
-        st.error(f"❌ Auth failed: {e}")
-        st.info("💡 Your ERCOT password is the same one you use to log into apiexplorer.ercot.com")
+if sub_key:
+    using_demo=False  # Try live data with sub key only
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 dfs=[]
 with st.spinner("Loading LMP data..."):
     for node in all_nodes:
         df=pd.DataFrame()
-        if not using_demo and token:
-            try: df=fetch_lmp(node,d_from,d_to,token,sub_key)
+        if not using_demo:
+            try: df=fetch_lmp(node,d_from,d_to,sub_key)
             except Exception as e: st.warning(f"⚠️ {node}: {str(e)[:100]}")
         if df.empty:
             using_demo=True
