@@ -1,459 +1,243 @@
 
-import { useState, useEffect, useCallback, useRef } from "react";
-import {
-  LineChart, Line, AreaChart, Area, BarChart, Bar,
-  XAxis, YAxis, CartesianGrid, Tooltip, Legend,
-  ResponsiveContainer, ReferenceLine, Brush
-} from "recharts";
+import streamlit as st
+import requests
+import pandas as pd
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import time
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-const ERCOT_API = "https://api.ercot.com/api/public-reports";
-const NODES = [
-  "HB_HOUSTON","HB_NORTH","HB_SOUTH","HB_WEST",
-  "LZ_HOUSTON","LZ_NORTH","LZ_SOUTH","LZ_WEST",
-  "LZ_AEN","LZ_CPS","LZ_LCRA","LZ_RAYBN",
-  "HOUSTON","NORTH","SOUTH","WEST"
-];
-const COLORS = ["#00d4ff","#ff6b6b","#51cf66","#ffd43b","#cc5de8","#ff922b"];
-const AGGREGATIONS = ["Hourly","Daily","Monthly","Yearly"];
+# ── Page Config ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="ERCOT LMP Dashboard",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
-const fmt = (d) => new Date(d).toLocaleDateString("en-US",{month:"short",day:"numeric"});
-const fmtM = (d) => new Date(d).toLocaleDateString("en-US",{year:"numeric",month:"short"});
-const fmtY = (d) => new Date(d).getFullYear().toString();
-const avg = (arr) => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0;
-const toISO = (d) => d.toISOString().split("T")[0];
+# ── Dark Theme CSS ─────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    .main { background-color: #0d0d1a; }
+    .stMetric { background: #111125; border: 1px solid #1e1e3a; border-radius: 10px; padding: 10px; }
+    h1, h2, h3 { color: #00d4ff; }
+    .stSelectbox label, .stDateInput label, .stMultiSelect label { color: #aaa; }
+</style>
+""", unsafe_allow_html=True)
 
-function addDays(d, n) { const x=new Date(d); x.setDate(x.getDate()+n); return x; }
-function addMonths(d, n) { const x=new Date(d); x.setMonth(x.getMonth()+n); return x; }
-function addYears(d, n) { const x=new Date(d); x.setFullYear(x.getFullYear()+n); return x; }
-
-// ─── Fetch ERCOT via Anthropic API (bypass CORS) ─────────────────────────────
-async function fetchViaAnthropic(prompt) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 4000,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
-      system: `You are an ERCOT data retrieval agent. When asked for LMP data, search ERCOT public API or web for the data and return ONLY a valid JSON array. No markdown, no explanation. Just raw JSON array.`,
-      messages: [{ role: "user", content: prompt }]
-    })
-  });
-  const data = await res.json();
-  const text = data.content.filter(c=>c.type==="text").map(c=>c.text).join("");
-  const clean = text.replace(/```json|```/g,"").trim();
-  try { return JSON.parse(clean); } catch { return null; }
+# ── ERCOT API Config ───────────────────────────────────────────────────────────
+BASE_URL = "https://api.ercot.com/api/public-reports/np6-785-er/spp_node_zone_hub"
+HEADERS = {
+    "Accept": "application/json",
+    "Ocp-Apim-Subscription-Key": st.secrets.get("ERCOT_API_KEY", "")
 }
 
-// ─── Direct ERCOT API Fetch ───────────────────────────────────────────────────
-async function fetchERCOTDirect(endpoint, params) {
-  const url = new URL(`${ERCOT_API}/${endpoint}`);
-  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
-  url.searchParams.set("size","9999");
-  const res = await fetch(url.toString(), {
-    headers: { "Accept": "application/json", "Ocp-Apim-Subscription-Key": "" }
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
+# ── Available Nodes ────────────────────────────────────────────────────────────
+NODES = [
+    "HB_HOUSTON", "HB_NORTH", "HB_SOUTH", "HB_WEST",
+    "LZ_HOUSTON", "LZ_NORTH", "LZ_SOUTH", "LZ_WEST",
+    "LZ_AEN", "LZ_CPS", "LZ_LCRA", "LZ_RAYBN"
+]
 
-// ─── Generate Demo Data (fallback) ───────────────────────────────────────────
-function genDemoData(node, from, to, agg) {
-  const data = [];
-  let d = new Date(from);
-  const end = new Date(to);
-  const seed = node.split("").reduce((a,c)=>a+c.charCodeAt(0),0);
-  const basePrice = 30 + (seed % 40);
-  let idx = 0;
-  while (d <= end) {
-    const t = d.getTime()/1000;
-    const seasonal = Math.sin(t/5184000)*15;
-    const daily = Math.sin(t/43200)*8;
-    const spike = Math.random()<0.03 ? Math.random()*120 : 0;
-    const noise = (Math.random()-0.5)*12;
-    const lmp = Math.max(0, basePrice + seasonal + daily + spike + noise);
-    let label;
-    if (agg==="Hourly") label = new Date(d).toISOString();
-    else if (agg==="Daily") label = toISO(d);
-    else if (agg==="Monthly") label = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
-    else label = d.getFullYear().toString();
-    data.push({ date: label, lmp: +lmp.toFixed(2), node });
-    if (agg==="Hourly") d = addDays(d,1/24);
-    else if (agg==="Daily") d = addDays(d,1);
-    else if (agg==="Monthly") d = addMonths(d,1);
-    else d = addYears(d,1);
-    idx++;
-    if (idx > 3000) break;
-  }
-  return data;
-}
+# ── Fetch from ERCOT API ───────────────────────────────────────────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_ercot_data(node: str, date_from: str, date_to: str) -> pd.DataFrame:
+    try:
+        params = {
+            "deliveryDateFrom": date_from,
+            "deliveryDateTo": date_to,
+            "settlementPoint": node,
+            "size": 9999
+        }
+        resp = requests.get(BASE_URL, headers=HEADERS, params=params, timeout=15)
+        resp.raise_for_status()
+        raw = resp.json()
+        records = raw.get("data", raw.get("items", []))
+        if not records:
+            return pd.DataFrame()
+        df = pd.DataFrame(records)
+        # Normalize column names
+        df.columns = [c.lower() for c in df.columns]
+        date_col = next((c for c in df.columns if "date" in c), None)
+        price_col = next((c for c in df.columns if "price" in c or "lmp" in c or "spp" in c), None)
+        if not date_col or not price_col:
+            return pd.DataFrame()
+        df = df.rename(columns={date_col: "datetime", price_col: "lmp"})
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce")
+        df["node"] = node
+        return df[["datetime", "lmp", "node"]].dropna()
+    except Exception as e:
+        st.warning(f"API error for {node}: {e}. Using demo data.")
+        return generate_demo_data(node, date_from, date_to)
 
-// ─── Aggregate raw hourly records ────────────────────────────────────────────
-function aggregate(records, agg) {
-  if (!records.length) return [];
-  const grouped = {};
-  records.forEach(r => {
-    let key;
-    const d = new Date(r.date || r.deliveryDate || r.timestamp);
-    if (agg==="Daily") key = toISO(d);
-    else if (agg==="Monthly") key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
-    else if (agg==="Yearly") key = d.getFullYear().toString();
-    else key = r.date;
-    if (!grouped[key]) grouped[key] = [];
-    grouped[key].push(r.lmp);
-  });
-  return Object.entries(grouped)
-    .map(([k,v]) => ({ date: k, lmp: +avg(v).toFixed(2) }))
-    .sort((a,b) => a.date.localeCompare(b.date));
-}
+# ── Demo Data Fallback ─────────────────────────────────────────────────────────
+def generate_demo_data(node: str, date_from: str, date_to: str) -> pd.DataFrame:
+    import numpy as np
+    seed = sum(ord(c) for c in node)
+    np.random.seed(seed % 1000)
+    dates = pd.date_range(start=date_from, end=date_to, freq="D")
+    base = 30 + (seed % 40)
+    n = len(dates)
+    seasonal = np.sin(np.linspace(0, 4 * np.pi, n)) * 15
+    noise = np.random.normal(0, 8, n)
+    spikes = np.where(np.random.random(n) < 0.03, np.random.uniform(50, 150, n), 0)
+    lmp = np.maximum(0, base + seasonal + noise + spikes)
+    return pd.DataFrame({"datetime": dates, "lmp": lmp.round(2), "node": node})
 
-// ─── Custom Tooltip ───────────────────────────────────────────────────────────
-const CustomTooltip = ({ active, payload, label }) => {
-  if (!active || !payload?.length) return null;
-  return (
-    <div style={{background:"#1a1a2e",border:"1px solid #333",borderRadius:8,padding:"10px 14px"}}>
-      <p style={{color:"#aaa",margin:0,fontSize:12}}>{label}</p>
-      {payload.map((p,i) => (
-        <p key={i} style={{color:p.color,margin:"4px 0 0",fontSize:13,fontWeight:600}}>
-          {p.name}: <span style={{color:"#fff"}}>${p.value?.toFixed(2)}/MWh</span>
-        </p>
-      ))}
-    </div>
-  );
-};
+# ── Aggregate Data ─────────────────────────────────────────────────────────────
+def aggregate(df: pd.DataFrame, agg: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if agg == "Hourly":
+        return df
+    elif agg == "Daily":
+        df["period"] = df["datetime"].dt.date
+    elif agg == "Monthly":
+        df["period"] = df["datetime"].dt.to_period("M").dt.to_timestamp()
+    elif agg == "Yearly":
+        df["period"] = df["datetime"].dt.to_period("Y").dt.to_timestamp()
+    return df.groupby(["period", "node"])["lmp"].mean().reset_index().rename(columns={"period": "datetime"})
 
-// ─── Main Component ───────────────────────────────────────────────────────────
-export default function ERCOTDashboard() {
-  const [selectedNodes, setSelectedNodes] = useState(["HB_HOUSTON"]);
-  const [aggregation, setAggregation] = useState("Daily");
-  const [chartType, setChartType] = useState("area");
-  const [dateFrom, setDateFrom] = useState(toISO(addYears(new Date(),-1)));
-  const [dateTo, setDateTo] = useState(toISO(new Date()));
-  const [chartData, setChartData] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [dataSource, setDataSource] = useState("");
-  const [stats, setStats] = useState({});
-  const [nodeSearch, setNodeSearch] = useState("");
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const abortRef = useRef(null);
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("⚡ ERCOT LMP")
+    st.markdown("---")
 
-  const fetchData = useCallback(async () => {
-    setLoading(true); setError(""); setDataSource("");
-    if (abortRef.current) abortRef.current = false;
-    const current = {};
-    abortRef.current = current;
+    selected_nodes = st.multiselect(
+        "Select Nodes", NODES,
+        default=["HB_HOUSTON"],
+        max_selections=6
+    )
 
-    try {
-      let allData = [];
-      // Try direct ERCOT API first
-      try {
-        const results = await Promise.all(selectedNodes.map(async node => {
-          const raw = await fetchERCOTDirect("np6-785-er/spp_node_zone_hub", {
-            deliveryDateFrom: dateFrom,
-            deliveryDateTo: dateTo,
-            settlementPoint: node
-          });
-          const records = (raw?.data || raw?.items || []).map(r => ({
-            date: r.deliveryDate || r.deliveryDatetime,
-            lmp: parseFloat(r.settlementPointPrice || r.lmp || 0),
-            node
-          }));
-          return records;
-        }));
-        results.forEach(r => allData.push(...r));
-        if (allData.length > 0) setDataSource("✅ Live ERCOT API");
-      } catch (e) {
-        // CORS fallback — use demo data
-        setDataSource("📊 Demo Data (CORS restricted — deploy with backend proxy for live data)");
-        selectedNodes.forEach(node => {
-          allData.push(...genDemoData(node, dateFrom, dateTo, aggregation));
-        });
-      }
-
-      if (current !== abortRef.current) return;
-
-      // Build combined chart data
-      const byNode = {};
-      selectedNodes.forEach(n => {
-        const nodeRecords = allData.filter(r => r.node === n);
-        const agged = aggregate(nodeRecords, aggregation);
-        agged.forEach(r => {
-          if (!byNode[r.date]) byNode[r.date] = { date: r.date };
-          byNode[r.date][n] = r.lmp;
-        });
-      });
-
-      const combined = Object.values(byNode).sort((a,b) => a.date.localeCompare(b.date));
-      setChartData(combined);
-
-      // Stats
-      const s = {};
-      selectedNodes.forEach(n => {
-        const vals = combined.map(r=>r[n]).filter(Boolean);
-        s[n] = {
-          avg: avg(vals).toFixed(2),
-          max: Math.max(...vals).toFixed(2),
-          min: Math.min(...vals).toFixed(2),
-          count: vals.length
-        };
-      });
-      setStats(s);
-    } catch(e) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
+    st.markdown("### Date Range")
+    preset = st.selectbox("Quick Range", ["1 Day","1 Week","1 Month","3 Months","1 Year","3 Years","5 Years","10 Years"])
+    preset_map = {
+        "1 Day": 1, "1 Week": 7, "1 Month": 30, "3 Months": 90,
+        "1 Year": 365, "3 Years": 1095, "5 Years": 1825, "10 Years": 3650
     }
-  }, [selectedNodes, dateFrom, dateTo, aggregation]);
+    default_from = datetime.today() - timedelta(days=preset_map[preset])
+    date_from = st.date_input("From", value=default_from)
+    date_to = st.date_input("To", value=datetime.today())
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+    agg = st.selectbox("Aggregation", ["Daily", "Monthly", "Yearly", "Hourly"])
+    chart_type = st.selectbox("Chart Type", ["Area", "Line", "Bar"])
+    show_mavg = st.checkbox("Show 7-period Moving Avg", value=True)
 
-  const toggleNode = (n) => {
-    setSelectedNodes(prev =>
-      prev.includes(n)
-        ? prev.filter(x => x !== n)
-        : [...prev.slice(-5), n]
-    );
-  };
+    refresh = st.button("🔄 Refresh Data", use_container_width=True)
 
-  const filteredNodes = NODES.filter(n => n.toLowerCase().includes(nodeSearch.toLowerCase()));
+# ── Main ───────────────────────────────────────────────────────────────────────
+st.title("⚡ ERCOT LMP Dashboard")
+st.caption("Locational Marginal Pricing — Settlement Point Prices ($/MWh)")
 
-  const fmtLabel = (v) => {
-    if (aggregation==="Monthly") return fmtM(v+"-01");
-    if (aggregation==="Yearly") return v;
-    return fmt(v);
-  };
+if not selected_nodes:
+    st.warning("Please select at least one node from the sidebar.")
+    st.stop()
 
-  // ─── Preset date ranges ────────────────────────────────────────────────────
-  const presets = [
-    {label:"1D", from:toISO(addDays(new Date(),-1)), agg:"Hourly"},
-    {label:"1W", from:toISO(addDays(new Date(),-7)), agg:"Hourly"},
-    {label:"1M", from:toISO(addMonths(new Date(),-1)), agg:"Daily"},
-    {label:"3M", from:toISO(addMonths(new Date(),-3)), agg:"Daily"},
-    {label:"1Y", from:toISO(addYears(new Date(),-1)), agg:"Monthly"},
-    {label:"3Y", from:toISO(addYears(new Date(),-3)), agg:"Monthly"},
-    {label:"5Y", from:toISO(addYears(new Date(),-5)), agg:"Yearly"},
-    {label:"10Y", from:toISO(addYears(new Date(),-10)), agg:"Yearly"},
-  ];
+# ── Fetch Data ─────────────────────────────────────────────────────────────────
+with st.spinner("Fetching ERCOT data..."):
+    all_dfs = []
+    for node in selected_nodes:
+        df = fetch_ercot_data(node, str(date_from), str(date_to))
+        if not df.empty:
+            all_dfs.append(df)
 
-  const s = {
-    app: {display:"flex",height:"100vh",background:"#0d0d1a",color:"#e0e0e0",fontFamily:"'Inter',sans-serif",overflow:"hidden"},
-    sidebar: {width:sidebarOpen?240:0,minWidth:sidebarOpen?240:0,overflow:"hidden",transition:"all .3s",background:"#111125",borderRight:"1px solid #1e1e3a",display:"flex",flexDirection:"column"},
-    sideInner: {padding:16,display:"flex",flexDirection:"column",gap:12,overflowY:"auto",flex:1},
-    main: {flex:1,display:"flex",flexDirection:"column",overflow:"hidden"},
-    header: {padding:"14px 20px",background:"#111125",borderBottom:"1px solid #1e1e3a",display:"flex",alignItems:"center",gap:12},
-    body: {flex:1,overflowY:"auto",padding:20,display:"flex",flexDirection:"column",gap:16},
-    card: {background:"#111125",border:"1px solid #1e1e3a",borderRadius:12,padding:16},
-    label: {fontSize:11,color:"#666",textTransform:"uppercase",letterSpacing:1,marginBottom:6},
-    btn: (active) => ({padding:"5px 12px",borderRadius:6,border:"1px solid "+(active?"#00d4ff":"#333"),background:active?"rgba(0,212,255,.15)":"transparent",color:active?"#00d4ff":"#888",cursor:"pointer",fontSize:12,fontWeight:active?600:400}),
-    input: {background:"#0d0d1a",border:"1px solid #2a2a4a",borderRadius:6,color:"#e0e0e0",padding:"6px 10px",fontSize:12,width:"100%",boxSizing:"border-box"},
-    nodeBtn: (active) => ({padding:"4px 10px",borderRadius:6,border:"1px solid "+(active?"#00d4ff":"#222"),background:active?"rgba(0,212,255,.1)":"#0d0d1a",color:active?"#00d4ff":"#888",cursor:"pointer",fontSize:11,width:"100%",textAlign:"left",marginBottom:4}),
-    statCard: (c) => ({background:`rgba(${c},0.08)`,border:`1px solid rgba(${c},0.25)`,borderRadius:8,padding:"10px 14px",flex:1,minWidth:100}),
-  };
+if not all_dfs:
+    st.error("No data returned. Check your date range or API key.")
+    st.stop()
 
-  return (
-    <div style={s.app}>
-      {/* Sidebar */}
-      <div style={s.sidebar}>
-        <div style={s.sideInner}>
-          <div>
-            <div style={s.label}>Nodes</div>
-            <input
-              style={s.input} placeholder="Search node..."
-              value={nodeSearch} onChange={e=>setNodeSearch(e.target.value)}
-            />
-            <div style={{marginTop:8}}>
-              {filteredNodes.map(n => (
-                <button key={n} style={s.nodeBtn(selectedNodes.includes(n))} onClick={()=>toggleNode(n)}>
-                  {selectedNodes.includes(n)?"✓ ":""}{n}
-                </button>
-              ))}
-            </div>
-          </div>
+combined = pd.concat(all_dfs, ignore_index=True)
+combined = aggregate(combined, agg)
 
-          <div>
-            <div style={s.label}>Aggregation</div>
-            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
-              {AGGREGATIONS.map(a=>(
-                <button key={a} style={s.btn(aggregation===a)} onClick={()=>setAggregation(a)}>{a}</button>
-              ))}
-            </div>
-          </div>
+# ── Stats Row ──────────────────────────────────────────────────────────────────
+st.markdown("### Summary Statistics")
+cols = st.columns(len(selected_nodes))
+for i, node in enumerate(selected_nodes):
+    node_df = combined[combined["node"] == node]
+    if not node_df.empty:
+        with cols[i]:
+            st.metric(f"📍 {node}", f"${node_df['lmp'].mean():.2f} avg")
+            st.caption(f"Max: ${node_df['lmp'].max():.2f} | Min: ${node_df['lmp'].min():.2f}")
 
-          <div>
-            <div style={s.label}>Chart Type</div>
-            <div style={{display:"flex",gap:4}}>
-              {["area","line","bar"].map(t=>(
-                <button key={t} style={s.btn(chartType===t)} onClick={()=>setChartType(t)}>{t}</button>
-              ))}
-            </div>
-          </div>
+st.markdown("---")
 
-          <div>
-            <div style={s.label}>Date Range</div>
-            <div style={{display:"flex",flexDirection:"column",gap:6}}>
-              <input type="date" style={s.input} value={dateFrom} onChange={e=>setDateFrom(e.target.value)} />
-              <input type="date" style={s.input} value={dateTo} onChange={e=>setDateTo(e.target.value)} />
-            </div>
-          </div>
+# ── Main Chart ─────────────────────────────────────────────────────────────────
+st.markdown("### LMP Price Chart")
+COLORS = ["#00d4ff","#ff6b6b","#51cf66","#ffd43b","#cc5de8","#ff922b"]
+fig = go.Figure()
 
-          <div>
-            <div style={s.label}>Quick Ranges</div>
-            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
-              {presets.map(p=>(
-                <button key={p.label} style={s.btn(dateFrom===p.from)} onClick={()=>{setDateFrom(p.from);setDateTo(toISO(new Date()));setAggregation(p.agg);}}>
-                  {p.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
+for i, node in enumerate(selected_nodes):
+    node_df = combined[combined["node"] == node].sort_values("datetime")
+    color = COLORS[i % len(COLORS)]
 
-      {/* Main */}
-      <div style={s.main}>
-        {/* Header */}
-        <div style={s.header}>
-          <button onClick={()=>setSidebarOpen(o=>!o)} style={{background:"none",border:"none",color:"#888",cursor:"pointer",fontSize:18,padding:0}}>☰</button>
-          <div>
-            <div style={{fontWeight:700,fontSize:16,color:"#fff"}}>⚡ ERCOT LMP Dashboard</div>
-            <div style={{fontSize:11,color:"#555"}}>Locational Marginal Pricing — Electrical Bus</div>
-          </div>
-          <div style={{flex:1}}/>
-          {dataSource && <div style={{fontSize:11,color:"#666",background:"#0d0d1a",padding:"4px 10px",borderRadius:6,border:"1px solid #222"}}>{dataSource}</div>}
-          <button onClick={fetchData} style={{padding:"6px 14px",background:"rgba(0,212,255,.15)",border:"1px solid #00d4ff",color:"#00d4ff",borderRadius:6,cursor:"pointer",fontSize:12,fontWeight:600}}>
-            {loading ? "⏳ Loading..." : "🔄 Refresh"}
-          </button>
-        </div>
+    if chart_type == "Area":
+        fig.add_trace(go.Scatter(
+            x=node_df["datetime"], y=node_df["lmp"],
+            name=node, mode="lines", line=dict(color=color, width=2),
+            fill="tozeroy", fillcolor=color.replace("ff","33").replace("#","rgba(").replace("33","0.15)") if "#" in color else color,
+            hovertemplate=f"<b>{node}</b><br>%{{x|%Y-%m-%d}}<br>${{y:.2f}}/MWh<extra></extra>"
+        ))
+    elif chart_type == "Line":
+        fig.add_trace(go.Scatter(
+            x=node_df["datetime"], y=node_df["lmp"],
+            name=node, mode="lines", line=dict(color=color, width=2),
+            hovertemplate=f"<b>{node}</b><br>%{{x|%Y-%m-%d}}<br>${{y:.2f}}/MWh<extra></extra>"
+        ))
+    elif chart_type == "Bar":
+        fig.add_trace(go.Bar(
+            x=node_df["datetime"], y=node_df["lmp"],
+            name=node, marker_color=color, opacity=0.85,
+            hovertemplate=f"<b>{node}</b><br>%{{x|%Y-%m-%d}}<br>${{y:.2f}}/MWh<extra></extra>"
+        ))
 
-        <div style={s.body}>
-          {/* Stats */}
-          {Object.keys(stats).length > 0 && (
-            <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
-              {selectedNodes.map((n,i) => {
-                const st = stats[n];
-                if (!st) return null;
-                const c = i===0?"0,212,255":i===1?"255,107,107":i===2?"81,207,102":"255,212,59";
-                return (
-                  <div key={n} style={s.statCard(c)}>
-                    <div style={{fontSize:10,color:"#888",marginBottom:4}}>{n}</div>
-                    <div style={{display:"flex",gap:12}}>
-                      <div><div style={{fontSize:10,color:"#666"}}>AVG</div><div style={{fontSize:15,fontWeight:700,color:`rgb(${c})`}}>${st.avg}</div></div>
-                      <div><div style={{fontSize:10,color:"#666"}}>MAX</div><div style={{fontSize:15,fontWeight:700,color:"#ff6b6b"}}>${st.max}</div></div>
-                      <div><div style={{fontSize:10,color:"#666"}}>MIN</div><div style={{fontSize:15,fontWeight:700,color:"#51cf66"}}>${st.min}</div></div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+    if show_mavg and chart_type != "Bar" and len(node_df) > 7:
+        node_df["mavg"] = node_df["lmp"].rolling(7, min_periods=1).mean()
+        fig.add_trace(go.Scatter(
+            x=node_df["datetime"], y=node_df["mavg"],
+            name=f"{node} (7-MA)", mode="lines",
+            line=dict(color=color, width=1.5, dash="dot"),
+            hovertemplate=f"<b>{node} MA</b><br>${{y:.2f}}/MWh<extra></extra>"
+        ))
 
-          {/* Main Chart */}
-          <div style={{...s.card, flex:1, minHeight:320}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-              <div style={{fontWeight:600,fontSize:14,color:"#fff"}}>
-                LMP Price — {aggregation} Average &nbsp;
-                <span style={{fontSize:11,color:"#555",fontWeight:400}}>$/MWh</span>
-              </div>
-              <div style={{fontSize:11,color:"#444"}}>{chartData.length} data points</div>
-            </div>
+fig.update_layout(
+    template="plotly_dark",
+    paper_bgcolor="#0d0d1a",
+    plot_bgcolor="#111125",
+    height=480,
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    xaxis=dict(showgrid=True, gridcolor="#1e1e3a", rangeslider=dict(visible=True)),
+    yaxis=dict(showgrid=True, gridcolor="#1e1e3a", tickprefix="$", title="$/MWh"),
+    hovermode="x unified",
+    margin=dict(l=50, r=20, t=40, b=40)
+)
+st.plotly_chart(fig, use_container_width=True)
 
-            {loading ? (
-              <div style={{height:280,display:"flex",alignItems:"center",justifyContent:"center"}}>
-                <div style={{textAlign:"center"}}>
-                  <div style={{fontSize:32,marginBottom:8}}>⏳</div>
-                  <div style={{color:"#555",fontSize:13}}>Fetching ERCOT data...</div>
-                </div>
-              </div>
-            ) : error ? (
-              <div style={{height:280,display:"flex",alignItems:"center",justifyContent:"center",color:"#ff6b6b"}}>{error}</div>
-            ) : chartData.length===0 ? (
-              <div style={{height:280,display:"flex",alignItems:"center",justifyContent:"center",color:"#555"}}>No data</div>
-            ) : (
-              <ResponsiveContainer width="100%" height={300}>
-                {chartType==="bar" ? (
-                  <BarChart data={chartData} margin={{top:5,right:20,left:0,bottom:5}}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1e1e3a" />
-                    <XAxis dataKey="date" tickFormatter={fmtLabel} tick={{fill:"#555",fontSize:11}} />
-                    <YAxis tick={{fill:"#555",fontSize:11}} tickFormatter={v=>`$${v}`} />
-                    <Tooltip content={<CustomTooltip/>} />
-                    <Legend wrapperStyle={{color:"#888",fontSize:12}} />
-                    {selectedNodes.map((n,i)=>(
-                      <Bar key={n} dataKey={n} fill={COLORS[i%COLORS.length]} opacity={0.85} radius={[2,2,0,0]} />
-                    ))}
-                  </BarChart>
-                ) : chartType==="line" ? (
-                  <LineChart data={chartData} margin={{top:5,right:20,left:0,bottom:5}}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1e1e3a" />
-                    <XAxis dataKey="date" tickFormatter={fmtLabel} tick={{fill:"#555",fontSize:11}} />
-                    <YAxis tick={{fill:"#555",fontSize:11}} tickFormatter={v=>`$${v}`} />
-                    <Tooltip content={<CustomTooltip/>} />
-                    <Legend wrapperStyle={{color:"#888",fontSize:12}} />
-                    <ReferenceLine y={0} stroke="#333" />
-                    {selectedNodes.map((n,i)=>(
-                      <Line key={n} type="monotone" dataKey={n} stroke={COLORS[i%COLORS.length]} strokeWidth={2} dot={false} activeDot={{r:4}} />
-                    ))}
-                    <Brush dataKey="date" height={20} stroke="#1e1e3a" fill="#0d0d1a" travellerWidth={6} />
-                  </LineChart>
-                ) : (
-                  <AreaChart data={chartData} margin={{top:5,right:20,left:0,bottom:5}}>
-                    <defs>
-                      {selectedNodes.map((n,i)=>(
-                        <linearGradient key={n} id={`grad${i}`} x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%" stopColor={COLORS[i%COLORS.length]} stopOpacity={0.3}/>
-                          <stop offset="95%" stopColor={COLORS[i%COLORS.length]} stopOpacity={0}/>
-                        </linearGradient>
-                      ))}
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1e1e3a" />
-                    <XAxis dataKey="date" tickFormatter={fmtLabel} tick={{fill:"#555",fontSize:11}} />
-                    <YAxis tick={{fill:"#555",fontSize:11}} tickFormatter={v=>`$${v}`} />
-                    <Tooltip content={<CustomTooltip/>} />
-                    <Legend wrapperStyle={{color:"#888",fontSize:12}} />
-                    {selectedNodes.map((n,i)=>(
-                      <Area key={n} type="monotone" dataKey={n} stroke={COLORS[i%COLORS.length]} strokeWidth={2}
-                        fill={`url(#grad${i})`} dot={false} activeDot={{r:4}} />
-                    ))}
-                    <Brush dataKey="date" height={20} stroke="#1e1e3a" fill="#0d0d1a" travellerWidth={6} />
-                  </AreaChart>
-                )}
-              </ResponsiveContainer>
-            )}
-          </div>
+# ── Node Comparison ────────────────────────────────────────────────────────────
+if len(selected_nodes) > 1:
+    st.markdown("### Node Comparison — Average LMP")
+    comp_data = []
+    for node in selected_nodes:
+        node_df = combined[combined["node"] == node]
+        comp_data.append({"Node": node, "Avg LMP ($/MWh)": round(node_df["lmp"].mean(), 2),
+                          "Max": round(node_df["lmp"].max(), 2), "Min": round(node_df["lmp"].min(), 2)})
+    comp_df = pd.DataFrame(comp_data)
+    fig2 = go.Figure(go.Bar(
+        x=comp_df["Node"], y=comp_df["Avg LMP ($/MWh)"],
+        marker_color=COLORS[:len(selected_nodes)],
+        text=comp_df["Avg LMP ($/MWh)"].apply(lambda x: f"${x:.2f}"),
+        textposition="outside"
+    ))
+    fig2.update_layout(
+        template="plotly_dark", paper_bgcolor="#0d0d1a", plot_bgcolor="#111125",
+        height=300, yaxis=dict(tickprefix="$", title="$/MWh"),
+        margin=dict(l=50, r=20, t=20, b=40)
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+    st.dataframe(comp_df.set_index("Node"), use_container_width=True)
 
-          {/* Comparison bar — yearly avg if multi-node */}
-          {selectedNodes.length > 1 && chartData.length > 0 && (
-            <div style={{...s.card}}>
-              <div style={{fontWeight:600,fontSize:13,color:"#fff",marginBottom:12}}>Node Comparison — Average LMP</div>
-              <div style={{display:"flex",gap:8,alignItems:"flex-end",height:80}}>
-                {selectedNodes.map((n,i)=>{
-                  const vals = chartData.map(r=>r[n]).filter(Boolean);
-                  const a = avg(vals);
-                  const maxA = Math.max(...selectedNodes.map(nn=>{
-                    const v = chartData.map(r=>r[nn]).filter(Boolean); return avg(v);
-                  }));
-                  const pct = maxA>0 ? (a/maxA)*100 : 0;
-                  return (
-                    <div key={n} style={{flex:1,textAlign:"center"}}>
-                      <div style={{fontSize:11,color:COLORS[i%COLORS.length],marginBottom:4}}>${a.toFixed(2)}</div>
-                      <div style={{height:`${Math.max(10,pct*0.6)}px`,background:COLORS[i%COLORS.length],borderRadius:"4px 4px 0 0",opacity:0.8}}/>
-                      <div style={{fontSize:10,color:"#555",marginTop:4}}>{n}</div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
+# ── Raw Data ───────────────────────────────────────────────────────────────────
+with st.expander("📄 View Raw Data"):
+    st.dataframe(combined.sort_values("datetime", ascending=False), use_container_width=True)
+    csv = combined.to_csv(index=False).encode()
+    st.download_button("⬇️ Download CSV", csv, "ercot_lmp.csv", "text/csv")
 
-          {/* Info footer */}
-          <div style={{fontSize:11,color:"#444",textAlign:"center",paddingBottom:8}}>
-            Data source: ERCOT Public API (np6-785-er/spp_node_zone_hub) • Settlement Point Prices •{" "}
-            <span style={{color:"#555"}}>For live data deploy with a backend proxy to bypass browser CORS restrictions</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
+st.caption("Data: ERCOT Public API — np6-785-er/spp_node_zone_hub | Auto-refreshes every 5 min")
