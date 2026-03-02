@@ -1,9 +1,8 @@
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ERCOT LMP Dashboard — Fresh build using:
-# GET /np6-785-er/spp_node_zone_hub  (getLMPNodeZoneHub)
-# Docs: https://apiexplorer.ercot.com
-# Auth: Bearer token via ERCOT B2C ROPC flow + Ocp-Apim-Subscription-Key header
+# ERCOT LMP Dashboard
+# Data source: https://data.ercot.com/data-product-archive/NP4-183-CD
+# No authentication required — public zip file downloads
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -12,15 +11,18 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta, date
+from io import BytesIO
+import zipfile
+import re
 
-# ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="ERCOT LMP", page_icon="⚡", layout="wide")
 st.markdown("""
 <style>
 [data-testid="stAppViewContainer"]{background:#0a0a14}
 [data-testid="stSidebar"]{background:#0f0f1e;border-right:1px solid #1e1e3a}
 [data-testid="stHeader"]{background:transparent}
-.card{background:#111125;border:1px solid #1e1e3a;border-radius:12px;padding:18px 20px;position:relative;margin-bottom:8px}
+.card{background:#111125;border:1px solid #1e1e3a;border-radius:12px;
+      padding:18px 20px;position:relative;margin-bottom:8px}
 .lbl{font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px}
 .val{font-size:28px;font-weight:700;color:#fff;margin:0}
 .sub{font-size:12px;color:#888;margin-top:4px}
@@ -30,330 +32,381 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── ERCOT API constants ────────────────────────────────────────────────────────
-# Correct endpoint from apiexplorer.ercot.com → getData_lmp_node_zone_hub
-BASE     = "https://api.ercot.com/api/public-reports"
-ENDPOINT = f"{BASE}/np6-785-er/spp_node_zone_hub"
-
-# ERCOT OAuth2 ROPC — official values from ERCOT developer portal
-TOKEN_URL = "https://ercotb2c.b2clogin.com/ercotb2c.onmicrosoft.com/B2C_1_PUBAPI-ROPC-FLOW/oauth2/v2.0/token"
-CLIENT_ID = "5f0baa1d-5124-47cc-a8dd-2c8d89d3e62e"   # Verified ERCOT public app registration
-
-NODES = [
-    "HB_HOUSTON","HB_NORTH","HB_SOUTH","HB_WEST",
-    "LZ_HOUSTON","LZ_NORTH","LZ_SOUTH","LZ_WEST",
-    "LZ_AEN","LZ_CPS","LZ_LCRA","LZ_RAYBN"
-]
 COLORS = ["#00d4ff","#ff6b6b","#51cf66","#ffd43b","#cc5de8","#ff922b"]
 
 def rgba(h, a=0.15):
-    h=h.lstrip("#"); r,g,b=int(h[:2],16),int(h[2:4],16),int(h[4:],16)
-    return f"rgba({r},{g},{b},{a})"
+    h = h.lstrip("#")
+    return f"rgba({int(h[:2],16)},{int(h[2:4],16)},{int(h[4:],16)},{a})"
 
-# ── Step 1: Get Bearer token ───────────────────────────────────────────────────
-@st.cache_data(ttl=3200, show_spinner=False)
-def get_token(username: str, password: str) -> str:
-    """
-    ERCOT ROPC OAuth2 flow.
-    Returns id_token which is used as Bearer token.
-    """
-    r = requests.post(TOKEN_URL,
-        data={
-            "grant_type":    "password",
-            "username":      username,
-            "password":      password,
-            "response_type": "id_token",
-            "scope":         f"openid offline_access {CLIENT_ID}",
-            "client_id":     CLIENT_ID,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=20
-    )
-    if not r.ok:
-        err = r.json()
-        raise Exception(f"HTTP {r.status_code} — {err.get('error_description', r.text)[:300]}")
-    j = r.json()
-    tok = j.get("id_token") or j.get("access_token")
-    if not tok:
-        raise Exception(f"No token in response. Keys returned: {list(j.keys())}")
-    return tok
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Get list of available zip files from ERCOT archive page
+# ─────────────────────────────────────────────────────────────────────────────
+ARCHIVE_URL = "https://data.ercot.com/data-product-archive/NP4-183-CD"
 
-# ── Step 2: Call the LMP endpoint ─────────────────────────────────────────────
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_lmp(node: str, d_from: str, d_to: str, token: str, sub_key: str) -> pd.DataFrame:
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_file_list() -> pd.DataFrame:
     """
-    GET /np6-785-er/spp_node_zone_hub
-    Params: settlementPoint, deliveryDateFrom, deliveryDateTo, size
-    Headers: Authorization: Bearer <id_token>
-             Ocp-Apim-Subscription-Key: <subscription_key>
+    Scrape the ERCOT archive page to get all available zip file links.
+    Returns DataFrame with columns: date, filename, url
     """
-    r = requests.get(ENDPOINT,
-        headers={
-            "Authorization":             f"Bearer {token}",
-            "Ocp-Apim-Subscription-Key": sub_key,
-            "Accept":                    "application/json",
-        },
-        params={
-            "settlementPoint":   node,
-            "deliveryDateFrom":  d_from,
-            "deliveryDateTo":    d_to,
-            "size":              9999,
-        },
-        timeout=25
-    )
+    r = requests.get(ARCHIVE_URL, timeout=20)
     r.raise_for_status()
-    return parse_ercot(r.json(), node)
 
-def parse_ercot(raw: dict, node: str) -> pd.DataFrame:
-    """Parse ERCOT's standard field+data response format."""
-    fields = [f["name"] for f in raw.get("fields", [])]
-    data   = raw.get("data", {})
+    # Find all zip file links — pattern: .../NP4-183-CD_YYYYMMDD.zip or similar
+    urls  = re.findall(r'href="([^"]*NP4-183[^"]*\.zip)"', r.text, re.IGNORECASE)
+    # Also try JSON/API endpoint that ERCOT might use
+    if not urls:
+        urls = re.findall(r'(https?://[^\s"<>]*NP4-183[^\s"<>]*\.zip)', r.text, re.IGNORECASE)
 
-    # ERCOT returns data as {"rows": [[val,val,...], ...]} or flat list
-    if isinstance(data, list):
-        rows = data
-    elif isinstance(data, dict):
-        rows = data.get("rows", [])
-    else:
-        rows = []
+    rows = []
+    for u in urls:
+        full = u if u.startswith("http") else "https://data.ercot.com" + u
+        # Extract date from filename
+        m = re.search(r'(\d{8})', full)
+        if m:
+            try:
+                d = datetime.strptime(m.group(1), "%Y%m%d").date()
+                rows.append({"date": d, "url": full, "label": d.strftime("%Y-%m-%d")})
+            except:
+                pass
 
-    if not rows:
+    if rows:
+        df = pd.DataFrame(rows).sort_values("date", ascending=False).drop_duplicates("date")
+        return df
+
+    # Fallback — try ERCOT's data API endpoint
+    try:
+        api = "https://data.ercot.com/api/1/services/search/archive/NP4-183-CD"
+        jr  = requests.get(api, timeout=10).json()
+        rows2 = []
+        for item in jr.get("data", jr.get("items", [])):
+            u = item.get("url","") or item.get("downloadUrl","")
+            n = item.get("filename","") or item.get("name","")
+            m = re.search(r'(\d{8})', u+n)
+            if m and u:
+                d = datetime.strptime(m.group(1), "%Y%m%d").date()
+                rows2.append({"date":d,"url":u,"label":d.strftime("%Y-%m-%d")})
+        if rows2:
+            return pd.DataFrame(rows2).sort_values("date",ascending=False).drop_duplicates("date")
+    except:
+        pass
+
+    return pd.DataFrame(columns=["date","url","label"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Download & parse a single zip file
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_zip(url: str) -> pd.DataFrame:
+    """
+    Download a zip from ERCOT, extract CSV, return clean DataFrame.
+    ERCOT DAM LMP CSV columns (NP4-183-CD):
+      DeliveryDate, HourEnding, BusName, LMP, MCC, MLC (or similar)
+    """
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+
+    with zipfile.ZipFile(BytesIO(r.content)) as z:
+        # Pick the first CSV file in the zip
+        csv_files = [f for f in z.namelist() if f.lower().endswith(".csv")]
+        if not csv_files:
+            return pd.DataFrame()
+        with z.open(csv_files[0]) as f:
+            # ERCOT CSVs sometimes have a header comment row — skip lines starting with #
+            raw = f.read().decode("utf-8", errors="replace")
+            lines = [l for l in raw.splitlines() if not l.startswith("#")]
+            df = pd.read_csv(BytesIO("\n".join(lines).encode()), low_memory=False)
+
+    # Normalize columns
+    df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
+
+    # Map to standard names
+    col_map = {}
+    for c in df.columns:
+        if "busname" in c or "bus_name" in c or c == "bus":
+            col_map[c] = "bus"
+        elif "deliverydate" in c or "delivery_date" in c:
+            col_map[c] = "date"
+        elif "hourending" in c or "hour_ending" in c or "hourendingcst" in c:
+            col_map[c] = "hour"
+        elif c == "lmp" or "lmp" in c:
+            col_map[c] = "lmp"
+    df = df.rename(columns=col_map)
+
+    needed = [c for c in ["date","hour","bus","lmp"] if c in df.columns]
+    if "lmp" not in df.columns or "bus" not in df.columns:
         return pd.DataFrame()
 
-    # Build dataframe
-    if fields and isinstance(rows[0], (list, tuple)):
-        df = pd.DataFrame(rows, columns=fields)
+    df = df[needed].copy()
+    df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce")
+
+    # Build datetime
+    if "date" in df.columns and "hour" in df.columns:
+        df["hour_num"] = pd.to_numeric(
+            df["hour"].astype(str).str.replace(":00","").str.strip(),
+            errors="coerce").fillna(1)
+        df["datetime"] = pd.to_datetime(df["date"], errors="coerce") + \
+                         pd.to_timedelta(df["hour_num"] - 1, unit="h")
+    elif "date" in df.columns:
+        df["datetime"] = pd.to_datetime(df["date"], errors="coerce")
     else:
-        df = pd.DataFrame(rows)
-
-    df.columns = [c.lower() for c in df.columns]
-
-    # Find relevant columns — ERCOT uses: deliveryDate, deliveryHour, settlementPointPrice
-    date_col  = next((c for c in df.columns if c in ("deliverydate","delivery_date","date")), None)
-    hour_col  = next((c for c in df.columns if "hour" in c and "ending" not in c), None)
-    price_col = next((c for c in df.columns if "price" in c or "spp" in c or "lmp" in c), None)
-
-    if not date_col or not price_col:
-        st.warning(f"Unexpected columns: {list(df.columns)}")
         return pd.DataFrame()
 
-    df["lmp"] = pd.to_numeric(df[price_col], errors="coerce")
+    return df[["datetime","bus","lmp"]].dropna().sort_values("datetime")
 
-    if hour_col:
-        # hourEnding is 1–24, convert to 0–23 offset
-        h = pd.to_numeric(df[hour_col], errors="coerce").fillna(1) - 1
-        df["datetime"] = pd.to_datetime(df[date_col]) + pd.to_timedelta(h, unit="h")
-    else:
-        df["datetime"] = pd.to_datetime(df[date_col])
 
-    df["node"] = node
-    return df[["datetime","lmp","node"]].dropna().sort_values("datetime")
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Load multiple days (for monthly view)
+# ─────────────────────────────────────────────────────────────────────────────
+def load_date_range(file_df: pd.DataFrame, d_from: date, d_to: date,
+                    progress_bar) -> pd.DataFrame:
+    mask  = (file_df["date"] >= d_from) & (file_df["date"] <= d_to)
+    files = file_df[mask].sort_values("date")
+    if files.empty:
+        return pd.DataFrame()
+    dfs = []
+    for i,(_, row) in enumerate(files.iterrows()):
+        progress_bar.progress((i+1)/len(files), text=f"Loading {row['label']}...")
+        try:
+            dfs.append(load_zip(row["url"]))
+        except Exception as e:
+            st.warning(f"⚠️ Could not load {row['label']}: {e}")
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-# ── Demo data fallback ─────────────────────────────────────────────────────────
-def demo_hourly(node, for_date):
-    s = sum(ord(c) for c in node) % 999; np.random.seed(s)
-    hrs   = pd.date_range(str(for_date), periods=24, freq="h")
-    shape = np.array([4,3,3,3,4,7,13,17,15,13,12,13,15,14,13,15,21,37,47,41,27,17,11,7],dtype=float)
-    lmp   = np.maximum(-8, 5+(s%25) + shape + np.random.normal(0,3,24))
-    return pd.DataFrame({"datetime":hrs,"lmp":lmp.round(2),"node":node})
 
-def demo_hist(node, d_from, d_to, freq="D"):
-    s = sum(ord(c) for c in node) % 999; np.random.seed(s)
-    dates = pd.date_range(d_from, d_to, freq=freq)
-    n = len(dates); t = np.arange(n)
-    lmp = np.maximum(-15,
-        30+(s%30)
-        + np.sin(t/(365 if freq=="D" else 12)*2*np.pi)*16
-        + np.linspace(0,10,n)
-        + np.random.normal(0,8,n)
-        + np.where(np.random.random(n)<0.025, np.random.uniform(80,250,n), 0)
-        + np.where(np.random.random(n)<0.01, -np.random.uniform(5,40,n), 0)
-    )
-    return pd.DataFrame({"datetime":dates,"lmp":lmp.round(2),"node":node})
-
-def do_agg(df, mode):
-    if mode in ("Hourly","Daily"): return df.copy()
-    df = df.copy()
-    df["p"] = df["datetime"].dt.to_period("M" if mode=="Monthly" else "Y").dt.to_timestamp()
-    g = df.groupby(["p","node"])["lmp"].agg(["mean","max","min"]).reset_index()
-    g.columns = ["datetime","node","lmp","lmp_max","lmp_min"]
-    return g
-
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚡ ERCOT LMP")
+    st.caption("Source: data.ercot.com / NP4-183-CD")
     st.markdown("---")
 
-    sub_key  = st.secrets.get("ERCOT_API_KEY","").strip()
-    username = st.secrets.get("ERCOT_USERNAME","").strip()
-    password = st.secrets.get("ERCOT_PASSWORD","").strip()
+    view = st.radio("Mode", ["📅 Single Day (24h)", "📆 Monthly Average"], index=0)
 
-    if sub_key and username and password:
-        st.success("✅ Credentials ready")
-    else:
-        st.warning("Add to Streamlit Secrets:")
-        st.code('ERCOT_API_KEY  = "your-subscription-key"\nERCOT_USERNAME = "your@email.com"\nERCOT_PASSWORD = "yourPassword"', language="toml")
-
-    node_grp  = st.radio("Node Type",["Hub","Load Zone","All"],horizontal=True)
-    pool      = (["HB_HOUSTON","HB_NORTH","HB_SOUTH","HB_WEST"] if node_grp=="Hub"
-                 else (["LZ_HOUSTON","LZ_NORTH","LZ_SOUTH","LZ_WEST","LZ_AEN","LZ_CPS","LZ_LCRA","LZ_RAYBN"]
-                       if node_grp=="Load Zone" else NODES))
-    sel_node  = st.selectbox("Primary Node", pool)
-    cmp_nodes = st.multiselect("Compare", [n for n in pool if n!=sel_node], max_selections=4)
-    all_nodes = [sel_node] + cmp_nodes
-
-    st.markdown("---")
-    view  = st.radio("View", ["📅 Daily","📆 Historical"])
     today = date.today()
-
-    if view == "📅 Daily":
-        sel_date = st.date_input("Date", value=today)
-        d_from = d_to = str(sel_date); agg = "Hourly"
+    if view == "📅 Single Day (24h)":
+        sel_date = st.date_input("Select Date",
+                                  value=today - timedelta(days=2),
+                                  max_value=today - timedelta(days=1))
+        d_from = d_to = sel_date
     else:
-        preset = st.selectbox("Range",["7 Days","30 Days","3 Months","1 Year","3 Years","5 Years","10 Years"])
-        dm = {"7 Days":7,"30 Days":30,"3 Months":90,"1 Year":365,"3 Years":1095,"5 Years":1825,"10 Years":3650}
-        ad = {"7 Days":"Daily","30 Days":"Daily","3 Months":"Daily","1 Year":"Monthly","3 Years":"Monthly","5 Years":"Yearly","10 Years":"Yearly"}
-        d_from = str(today-timedelta(days=dm[preset])); d_to = str(today)
-        agg = st.selectbox("Aggregation",["Daily","Monthly","Yearly"],
-                           index=["Daily","Monthly","Yearly"].index(ad[preset]))
+        col1, col2 = st.columns(2)
+        with col1:
+            sel_year  = st.selectbox("Year",  list(range(today.year, 2010, -1)))
+        with col2:
+            sel_month = st.selectbox("Month",
+                list(range(1,13)),
+                index=today.month - 2 if today.month > 1 else 0,
+                format_func=lambda m: datetime(2000,m,1).strftime("%b"))
+        import calendar
+        _, last_day = calendar.monthrange(sel_year, sel_month)
+        d_from = date(sel_year, sel_month, 1)
+        d_to   = date(sel_year, sel_month, last_day)
+        st.caption(f"📅 {d_from} → {d_to}")
 
-    chart_t = st.selectbox("Chart Style",["Line","Area","Bar"])
-    show_b  = st.checkbox("Min/Max Band", value=True)
-    show_ma = st.checkbox("Moving Avg",   value=True)
-    ma_w    = st.slider("MA Window",2,30,7) if show_ma else 7
+    chart_t = st.selectbox("Chart Style", ["Line","Area","Bar"])
+    show_ma = st.checkbox("Moving Average", value=True)
+    ma_w    = st.slider("MA Window", 2, 12, 3) if show_ma else 3
 
-# ── Header ─────────────────────────────────────────────────────────────────────
-h1,h2 = st.columns([6,1])
-with h1: st.markdown(f"### ⚡ MARKET: ERCOT &nbsp;/&nbsp; **{sel_node}**")
-with h2:
-    if st.button("🔄 Refresh", use_container_width=True):
+    if st.button("🔄 Clear Cache & Reload", use_container_width=True):
         st.cache_data.clear(); st.rerun()
 
-# ── Authenticate ───────────────────────────────────────────────────────────────
-token = None; live = False
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("### ⚡ ERCOT DAM LMP Dashboard")
+st.caption("Day-Ahead Market Locational Marginal Prices — NP4-183-CD ($/MWh)")
 
-if sub_key and username and password:
-    with st.spinner("🔐 Authenticating..."):
-        try:
-            token = get_token(username, password)
-            live  = True
-        except Exception as e:
-            st.error(f"❌ Auth error: {e}")
+# Load file index
+with st.spinner("📋 Loading ERCOT file index..."):
+    file_df = get_file_list()
 
-# ── Fetch data ─────────────────────────────────────────────────────────────────
-freq_map = {"Daily":"D","Monthly":"ME","Yearly":"YE","Hourly":"h"}
-dfs = []
-with st.spinner("📡 Loading LMP data..."):
-    for node in all_nodes:
-        df = pd.DataFrame()
-        if live and token:
+if file_df.empty:
+    st.error("""
+❌ Could not load file list from data.ercot.com.
+
+**Workaround — Upload a file manually:**
+1. Go to 👉 https://data.ercot.com/data-product-archive/NP4-183-CD
+2. Download a zip file for any date
+3. Upload it below
+""")
+    uploaded = st.file_uploader("Upload ERCOT NP4-183-CD zip file", type="zip")
+    if uploaded:
+        with st.spinner("Parsing uploaded file..."):
             try:
-                df = fetch_lmp(node, d_from, d_to, token, sub_key)
-            except requests.HTTPError as e:
-                st.warning(f"⚠️ {node} → HTTP {e.response.status_code}: {e.response.text[:150]}")
+                with zipfile.ZipFile(BytesIO(uploaded.read())) as z:
+                    csv_files = [f for f in z.namelist() if f.lower().endswith(".csv")]
+                    if csv_files:
+                        with z.open(csv_files[0]) as f:
+                            raw = f.read().decode("utf-8", errors="replace")
+                            lines = [l for l in raw.splitlines() if not l.startswith("#")]
+                            df_raw = pd.read_csv(BytesIO("\n".join(lines).encode()), low_memory=False)
+                            df_raw.columns = [c.strip().lower().replace(" ","_") for c in df_raw.columns]
+                            st.success(f"✅ Loaded! Columns: {list(df_raw.columns)}")
+                            st.dataframe(df_raw.head(20), use_container_width=True)
+                            # Store for use below
+                            st.session_state["uploaded_df"] = df_raw
             except Exception as e:
-                st.warning(f"⚠️ {node} → {str(e)[:150]}")
-        if df.empty:
-            df = (demo_hourly(node, date.fromisoformat(d_from)) if agg=="Hourly"
-                  else demo_hist(node, d_from, d_to, freq_map.get(agg,"D")))
-        dfs.append(df)
+                st.error(f"Parse error: {e}")
+    st.stop()
 
-is_demo = not live or all(d.empty for d in dfs)
-if not live:
-    st.info("📊 **Demo data** — Add `ERCOT_API_KEY`, `ERCOT_USERNAME`, `ERCOT_PASSWORD` to Streamlit Secrets for live data.")
-elif live and any(d.empty for d in dfs):
-    st.warning("Some nodes returned no data — showing demo for those nodes.")
-else:
-    st.success("🟢 Live ERCOT data loaded successfully!")
+# Show available date range
+min_d = file_df["date"].min(); max_d = file_df["date"].max()
+st.info(f"📦 {len(file_df)} files available — {min_d} → {max_d}")
 
-# ── KPI cards ──────────────────────────────────────────────────────────────────
-p = dfs[0]
-c_lmp  = float(p["lmp"].iloc[-1])   if not p.empty else 0.0
-d_avg  = float(p["lmp"].mean())     if not p.empty else 0.0
-d_max  = float(p["lmp"].max())      if not p.empty else 0.0
-p_time = (p.loc[p["lmp"].idxmax(),"datetime"].strftime("%H:%M") if not p.empty else "--")
-vstd   = float(p["lmp"].std())      if not p.empty else 0.0
-vlbl   = "Low" if vstd<5 else ("High" if vstd>15 else "Moderate")
-mid    = len(p)//2
-base   = p["lmp"].iloc[:mid].mean() if mid>0 else 1
-dpct   = ((p["lmp"].iloc[mid:].mean()-base)/abs(base)*100) if base!=0 else 0
+# Load data
+pb   = st.progress(0, text="Loading...")
+data = load_date_range(file_df, d_from, d_to, pb)
+pb.empty()
+
+if data.empty:
+    st.error(f"No data found for {d_from} → {d_to}. Try a different date.")
+    st.stop()
+
+# Bus selector — populated from actual data
+all_buses = sorted(data["bus"].dropna().unique().tolist())
+default_buses = [b for b in ["HB_HOUSTON","HB_NORTH","HB_SOUTH","HB_WEST"] if b in all_buses]
+if not default_buses and all_buses:
+    default_buses = all_buses[:1]
+
+selected_buses = st.multiselect(
+    "🔌 Select Bus / Settlement Point",
+    options=all_buses,
+    default=default_buses[:1],
+    max_selections=6
+)
+
+if not selected_buses:
+    st.warning("Please select at least one bus.")
+    st.stop()
+
+filt = data[data["bus"].isin(selected_buses)].copy()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KPI CARDS
+# ─────────────────────────────────────────────────────────────────────────────
+p    = filt[filt["bus"] == selected_buses[0]]
+c_lmp = float(p["lmp"].iloc[-1])  if not p.empty else 0
+d_avg = float(p["lmp"].mean())    if not p.empty else 0
+d_max = float(p["lmp"].max())     if not p.empty else 0
+d_min = float(p["lmp"].min())     if not p.empty else 0
+vstd  = float(p["lmp"].std())     if not p.empty else 0
+vlbl  = "Low" if vstd<5 else ("High" if vstd>15 else "Moderate")
+p_t   = p.loc[p["lmp"].idxmax(),"datetime"].strftime("%m-%d %H:%M") if not p.empty else "--"
+vc    = "pos" if vlbl=="Low" else ("neg" if vlbl=="High" else "neu")
 
 k1,k2,k3,k4 = st.columns(4)
-bc = "pos" if dpct>=0 else "neg"
-vc = "pos" if vlbl=="Low" else ("neg" if vlbl=="High" else "neu")
-with k1: st.markdown(f'<div class="card"><div class="lbl">⚡ Current LMP</div><div class="val">${c_lmp:.2f}</div><div class="sub">{"🟢 Live" if live else "🟡 Demo"} · DAM</div><span class="{bc}">{dpct:+.1f}%</span></div>',unsafe_allow_html=True)
-with k2: st.markdown(f'<div class="card"><div class="lbl">📊 Avg LMP</div><div class="val">${d_avg:.2f}</div><div class="sub">Period average · $/MWh</div></div>',unsafe_allow_html=True)
-with k3: st.markdown(f'<div class="card"><div class="lbl">🔺 Peak LMP</div><div class="val">${d_max:.2f}</div><div class="sub">Occurred at {p_time}</div></div>',unsafe_allow_html=True)
-with k4: st.markdown(f'<div class="card"><div class="lbl">📉 Volatility</div><div class="val">{vstd:.1f}</div><div class="sub">Std Dev · {vlbl}</div><span class="{vc}">{vlbl}</span></div>',unsafe_allow_html=True)
-st.markdown("<br>",unsafe_allow_html=True)
+with k1: st.markdown(f'<div class="card"><div class="lbl">⚡ Last LMP</div><div class="val">${c_lmp:.2f}</div><div class="sub">Most recent hour · $/MWh</div></div>',unsafe_allow_html=True)
+with k2: st.markdown(f'<div class="card"><div class="lbl">📊 Average LMP</div><div class="val">${d_avg:.2f}</div><div class="sub">Period average · $/MWh</div></div>',unsafe_allow_html=True)
+with k3: st.markdown(f'<div class="card"><div class="lbl">🔺 Peak LMP</div><div class="val">${d_max:.2f}</div><div class="sub">At {p_t}</div><span class="neg">▲ peak</span></div>',unsafe_allow_html=True)
+with k4: st.markdown(f'<div class="card"><div class="lbl">📉 Volatility</div><div class="val">{vstd:.1f}</div><div class="sub">Std Dev — {vlbl}</div><span class="{vc}">{vlbl}</span></div>',unsafe_allow_html=True)
 
-# ── Chart ──────────────────────────────────────────────────────────────────────
-ch, roi = st.columns([2,1])
+st.markdown("<br>", unsafe_allow_html=True)
 
-with ch:
-    st.markdown(f'<div style="font-size:13px;font-weight:600;color:#aaa;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:12px">LMP · {agg} · {sel_node}</div>',unsafe_allow_html=True)
-    fig = go.Figure()
-    for i,(node,df) in enumerate(zip(all_nodes,dfs)):
-        c   = COLORS[i%len(COLORS)]
-        adf = do_agg(df,agg).sort_values("datetime")
-        hb  = "lmp_max" in adf.columns
-        if show_b and hb:
-            fig.add_trace(go.Scatter(
-                x=pd.concat([adf["datetime"],adf["datetime"][::-1]]),
-                y=pd.concat([adf["lmp_max"],adf["lmp_min"][::-1]]),
-                fill="toself",fillcolor=rgba(c,0.08),
-                line=dict(color="rgba(0,0,0,0)"),showlegend=False,hoverinfo="skip"))
-        ht = f"<b>{node}</b><br>%{{x}}<br>${{y:.2f}}/MWh<extra></extra>"
-        if chart_t=="Bar":
-            fig.add_trace(go.Bar(x=adf["datetime"],y=adf["lmp"],name=node,
-                marker_color=c,opacity=0.85,hovertemplate=ht))
-        elif chart_t=="Area":
-            fig.add_trace(go.Scatter(x=adf["datetime"],y=adf["lmp"],name=node,
-                mode="lines",line=dict(color=c,width=2.5),
-                fill="tozeroy",fillcolor=rgba(c,0.15),hovertemplate=ht))
-        else:
-            fig.add_trace(go.Scatter(x=adf["datetime"],y=adf["lmp"],name=node,
-                mode="lines",line=dict(color=c,width=2.5),hovertemplate=ht))
-        if show_ma and len(adf)>=ma_w:
-            ma = adf["lmp"].rolling(ma_w,min_periods=1).mean()
-            fig.add_trace(go.Scatter(x=adf["datetime"],y=ma,name=f"{node} MA{ma_w}",
-                mode="lines",line=dict(color=c,width=1.2,dash="dot"),
-                hovertemplate=f"MA: $%{{y:.2f}}<extra></extra>"))
-    fig.add_hline(y=0,line_dash="dash",line_color="#333",line_width=1)
-    fig.update_layout(
-        template="plotly_dark",paper_bgcolor="#0a0a14",plot_bgcolor="#111125",height=430,
-        legend=dict(orientation="h",y=1.07,x=0,font=dict(size=11),bgcolor="rgba(0,0,0,0)"),
-        xaxis=dict(showgrid=True,gridcolor="#1a1a2e",
-                   rangeslider=dict(visible=True,bgcolor="#0a0a14",thickness=0.05)),
-        yaxis=dict(showgrid=True,gridcolor="#1a1a2e",tickprefix="$",
-                   title="$/MWh",zeroline=True,zerolinecolor="#444"),
-        hovermode="x unified",margin=dict(l=55,r=10,t=40,b=40),barmode="group")
-    st.plotly_chart(fig,use_container_width=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# CHART
+# ─────────────────────────────────────────────────────────────────────────────
+if view == "📅 Single Day (24h)":
+    title = f"24-Hour LMP — {sel_date} — {', '.join(selected_buses)}"
+    x_title = "Hour"
+else:
+    title = f"Monthly Average LMP — {d_from.strftime('%B %Y')} — {', '.join(selected_buses)}"
+    # Aggregate to daily average for monthly view
+    filt["day"] = filt["datetime"].dt.normalize()
+    filt = filt.groupby(["day","bus"])["lmp"].agg(
+        lmp="mean", lmp_max="max", lmp_min="min"
+    ).reset_index().rename(columns={"day":"datetime"})
+    x_title = "Date"
 
-# ── Storage ROI ────────────────────────────────────────────────────────────────
-with roi:
-    st.markdown('<div style="font-size:13px;font-weight:600;color:#aaa;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:12px">🔋 Storage ROI</div>',unsafe_allow_html=True)
-    pw  = st.slider("Power (MW)",1,500,10)
-    dur = st.slider("Duration (MWh)",1,1000,20)
-    n4  = max(1,len(p)//4); sl=p["lmp"].sort_values()
-    buy = sl.iloc[:n4].mean(); sell=sl.iloc[-n4:].mean()
-    spd = max(0,sell-buy); drev=spd*dur; mrev=drev*30
-    st.markdown(f'<div class="card"><div class="lbl">Daily Revenue</div><div class="val" style="font-size:22px">${drev:,.2f}</div><div class="sub">~${mrev:,.0f}/month</div><span class="pos">+{abs(spd/max(buy,1)*100):.1f}% spread</span></div>',unsafe_allow_html=True)
-    st.markdown(f'<div class="card"><div class="lbl">Price Spread</div><div class="val" style="font-size:22px">${spd:.2f}</div><div class="sub">Buy ${buy:.2f} → Sell ${sell:.2f}</div></div>',unsafe_allow_html=True)
-    st.markdown(f'<div class="card"><div class="lbl">Annual Revenue</div><div class="val" style="font-size:22px">${drev*365:,.0f}</div><div class="sub">{pw} MW · {dur} MWh</div></div>',unsafe_allow_html=True)
-    st.button("▶ Run Full Simulation",use_container_width=True,type="primary")
+fig = go.Figure()
+for i, bus in enumerate(selected_buses):
+    c   = COLORS[i % len(COLORS)]
+    bdf = filt[filt["bus"] == bus].sort_values("datetime")
+    if bdf.empty: continue
 
-# ── Summary table ──────────────────────────────────────────────────────────────
-if view == "📆 Historical":
+    # Min/max band for monthly view
+    if view == "📆 Monthly Average" and "lmp_max" in bdf.columns:
+        fig.add_trace(go.Scatter(
+            x=pd.concat([bdf["datetime"], bdf["datetime"][::-1]]),
+            y=pd.concat([bdf["lmp_max"], bdf["lmp_min"][::-1]]),
+            fill="toself", fillcolor=rgba(c, 0.08),
+            line=dict(color="rgba(0,0,0,0)"),
+            showlegend=False, hoverinfo="skip", name=f"{bus} range"
+        ))
+
+    ht = f"<b>{bus}</b><br>%{{x}}<br><b>${{y:.2f}}/MWh</b><extra></extra>"
+    if chart_t == "Bar":
+        fig.add_trace(go.Bar(
+            x=bdf["datetime"], y=bdf["lmp"], name=bus,
+            marker_color=c, opacity=0.85, hovertemplate=ht))
+    elif chart_t == "Area":
+        fig.add_trace(go.Scatter(
+            x=bdf["datetime"], y=bdf["lmp"], name=bus,
+            mode="lines", line=dict(color=c, width=2.5),
+            fill="tozeroy", fillcolor=rgba(c, 0.15), hovertemplate=ht))
+    else:
+        fig.add_trace(go.Scatter(
+            x=bdf["datetime"], y=bdf["lmp"], name=bus,
+            mode="lines", line=dict(color=c, width=2.5), hovertemplate=ht))
+
+    # Moving average
+    if show_ma and len(bdf) >= ma_w:
+        ma = bdf["lmp"].rolling(ma_w, min_periods=1).mean()
+        fig.add_trace(go.Scatter(
+            x=bdf["datetime"], y=ma, name=f"{bus} MA{ma_w}",
+            mode="lines", line=dict(color=c, width=1.2, dash="dot"),
+            hovertemplate=f"MA: $%{{y:.2f}}<extra></extra>"))
+
+fig.add_hline(y=0, line_dash="dash", line_color="#333", line_width=1)
+fig.update_layout(
+    title=dict(text=title, font=dict(color="#aaa", size=13)),
+    template="plotly_dark", paper_bgcolor="#0a0a14", plot_bgcolor="#111125",
+    height=480,
+    legend=dict(orientation="h", y=1.06, x=0, font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
+    xaxis=dict(title=x_title, showgrid=True, gridcolor="#1a1a2e",
+               rangeslider=dict(visible=True, bgcolor="#0a0a14", thickness=0.04)),
+    yaxis=dict(title="LMP ($/MWh)", showgrid=True, gridcolor="#1a1a2e",
+               tickprefix="$", zeroline=True, zerolinecolor="#444"),
+    hovermode="x unified", margin=dict(l=60,r=15,t=50,b=40), barmode="group"
+)
+st.plotly_chart(fig, use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HOURLY PROFILE TABLE (single day)
+# ─────────────────────────────────────────────────────────────────────────────
+if view == "📅 Single Day (24h)":
+    with st.expander("🕐 Hourly LMP Table"):
+        pivot = filt.pivot_table(index="datetime", columns="bus", values="lmp").round(2)
+        pivot.index = pivot.index.strftime("%H:%M")
+        st.dataframe(pivot, use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MONTHLY SUMMARY TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+if view == "📆 Monthly Average":
     st.markdown("---")
-    rows = [{"Node":n,"Avg $/MWh":round(d["lmp"].mean(),2),"Max":round(d["lmp"].max(),2),
-             "Min":round(d["lmp"].min(),2),"Std Dev":round(d["lmp"].std(),2),"Records":len(d)}
-            for n,d in zip(all_nodes,dfs) if not d.empty]
-    if rows: st.dataframe(pd.DataFrame(rows).set_index("Node"),use_container_width=True)
+    st.markdown("#### 📋 Monthly Summary")
+    rows = []
+    for bus in selected_buses:
+        bd = data[data["bus"]==bus]["lmp"]
+        if bd.empty: continue
+        rows.append({"Bus":bus, "Avg $/MWh":round(bd.mean(),2),
+                     "Max":round(bd.max(),2), "Min":round(bd.min(),2),
+                     "Std Dev":round(bd.std(),2), "Hours":len(bd)})
+    if rows:
+        st.dataframe(pd.DataFrame(rows).set_index("Bus"), use_container_width=True)
 
-with st.expander("📄 Raw Data & CSV Export"):
-    raw = pd.concat(dfs)[["datetime","lmp","node"]].sort_values("datetime",ascending=False)
-    st.dataframe(raw,use_container_width=True)
-    st.download_button("⬇️ Download CSV",raw.to_csv(index=False).encode(),"ercot_lmp.csv","text/csv")
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+with st.expander("📄 Raw Data & Export"):
+    show = data[data["bus"].isin(selected_buses)].sort_values("datetime", ascending=False)
+    st.dataframe(show, use_container_width=True)
+    st.download_button("⬇️ Download CSV",
+                       show.to_csv(index=False).encode(),
+                       "ercot_lmp.csv", "text/csv",
+                       use_container_width=True)
 
-st.caption(f"Endpoint: GET /np6-785-er/spp_node_zone_hub · {'🟢 Live ERCOT Data' if live else '🟡 Demo Data'}")
+st.caption("Data: ERCOT NP4-183-CD DAM Hourly LMP | Source: data.ercot.com")
