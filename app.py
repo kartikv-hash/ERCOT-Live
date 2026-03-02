@@ -25,10 +25,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── ERCOT API Config ───────────────────────────────────────────────────────────
-BASE_URL = "https://api.ercot.com/api/public-reports/np6-785-er/spp_node_zone_hub_da_lmp"
+# ERCOT API endpoints to try in order
+ENDPOINTS = [
+    "https://api.ercot.com/api/public-reports/np6-785-er/spp_node_zone_hub_da_lmp",
+    "https://api.ercot.com/api/public-reports/np6-788-cd/spp_hrly_actual_fcast_geo",
+    "https://api.ercot.com/api/public-reports/np4-190-cd/lmp_electrical_bus",
+]
 HEADERS = {
     "Accept": "application/json",
-    "Ocp-Apim-Subscription-Key": st.secrets.get("ERCOT_API_KEY", "")
+    "Ocp-Apim-Subscription-Key": st.secrets.get("ERCOT_API_KEY", ""),
+    "Authorization": f"Bearer {st.secrets.get('ERCOT_TOKEN', '')}"
 }
 
 # ── Available Nodes ────────────────────────────────────────────────────────────
@@ -41,34 +47,41 @@ NODES = [
 # ── Fetch from ERCOT API ───────────────────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ercot_data(node: str, date_from: str, date_to: str) -> pd.DataFrame:
-    try:
-        params = {
-            "deliveryDateFrom": date_from,
-            "deliveryDateTo": date_to,
-            "settlementPoint": node,
-            "size": 9999
-        }
-        resp = requests.get(BASE_URL, headers=HEADERS, params=params, timeout=15)
-        resp.raise_for_status()
-        raw = resp.json()
-        records = raw.get("data", raw.get("items", []))
-        if not records:
-            return pd.DataFrame()
-        df = pd.DataFrame(records)
-        # Normalize column names
-        df.columns = [c.lower() for c in df.columns]
-        date_col = next((c for c in df.columns if "date" in c), None)
-        price_col = next((c for c in df.columns if "price" in c or "lmp" in c or "spp" in c), None)
-        if not date_col or not price_col:
-            return pd.DataFrame()
-        df = df.rename(columns={date_col: "datetime", price_col: "lmp"})
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce")
-        df["node"] = node
-        return df[["datetime", "lmp", "node"]].dropna()
-    except Exception as e:
-        st.warning(f"API error for {node}: {e}. Using demo data.")
-        return generate_demo_data(node, date_from, date_to)
+    params = {
+        "deliveryDateFrom": date_from,
+        "deliveryDateTo": date_to,
+        "settlementPoint": node,
+        "busName": node,
+        "size": 9999
+    }
+    last_err = None
+    for endpoint in ENDPOINTS:
+        try:
+            resp = requests.get(endpoint, headers=HEADERS, params=params, timeout=15)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            raw = resp.json()
+            records = raw.get("data", raw.get("items", raw.get("_items", [])))
+            if not records:
+                continue
+            df = pd.DataFrame(records)
+            df.columns = [c.lower() for c in df.columns]
+            date_col = next((c for c in df.columns if "date" in c or "time" in c), None)
+            price_col = next((c for c in df.columns if "price" in c or "lmp" in c or "spp" in c), None)
+            if not date_col or not price_col:
+                continue
+            df = df.rename(columns={date_col: "datetime", price_col: "lmp"})
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce")
+            df["node"] = node
+            st.success(f"Live data loaded from ERCOT API for {node}!")
+            return df[["datetime", "lmp", "node"]].dropna()
+        except Exception as e:
+            last_err = e
+            continue
+    st.info(f"ℹ️ Using demo data for **{node}** — [Get a free ERCOT API key](https://apiexplorer.ercot.com) and add it to Streamlit Secrets to load live data.")
+    return generate_demo_data(node, date_from, date_to)
 
 # ── Demo Data Fallback ─────────────────────────────────────────────────────────
 def generate_demo_data(node: str, date_from: str, date_to: str) -> pd.DataFrame:
