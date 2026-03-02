@@ -327,7 +327,6 @@ for i, bus in enumerate(sel):
     bdf = plot_df[plot_df["bus"]==bus].sort_values("datetime")
     if bdf.empty: continue
 
-    # Min/max shaded band
     if "lmp_max" in bdf.columns:
         fig.add_trace(go.Scatter(
             x=pd.concat([bdf["datetime"], bdf["datetime"][::-1]]),
@@ -343,7 +342,7 @@ for i, bus in enumerate(sel):
     elif chart_t == "Area":
         fig.add_trace(go.Scatter(x=bdf["datetime"], y=bdf["lmp"], name=bus,
             mode="lines", line=dict(color=c, width=2),
-            fill="tozeroy", fillcolor=rgba(c,0.12), hovertemplate=ht))
+            fill="tozeroy", fillcolor=rgba(c, 0.12), hovertemplate=ht))
     else:
         fig.add_trace(go.Scatter(x=bdf["datetime"], y=bdf["lmp"], name=bus,
             mode="lines", line=dict(color=c, width=2), hovertemplate=ht))
@@ -354,23 +353,32 @@ for i, bus in enumerate(sel):
             mode="lines", line=dict(color=c, width=1, dash="dot"),
             hovertemplate=f"MA $%{{y:.2f}}<extra></extra>"))
 
-fig.add_hline(y=0, line_dash="dash", line_color="rgba(0,255,153,0.12)", line_width=1)
+fig.add_shape(type="line", x0=0, x1=1, xref="paper", y0=0, y1=0,
+              line=dict(color="rgba(0,255,153,0.15)", width=1, dash="dash"))
 fig.update_layout(
-    template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="#020818", height=500,
-    font=dict(family="Rajdhani", color="#00ff9970"),
+    template="plotly_dark",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="#020818",
+    height=500,
+    font=dict(family="Rajdhani", color="rgba(0,255,153,0.7)"),
     legend=dict(orientation="h", y=1.06, x=0,
-                font=dict(size=12,color="#00ff99"), bgcolor="rgba(0,0,0,0)"),
-    xaxis=dict(title=x_lbl, showgrid=True, gridcolor="rgba(0,255,153,0.06)",
-               tickfont=dict(color="rgba(0,255,153,0.7)"),
-               rangeslider=dict(visible=True, bgcolor="#020818", thickness=0.04),
-               showline=True, linecolor="rgba(0,255,153,0.12)"),
-    yaxis=dict(title="LMP ($/MWh)", showgrid=True, gridcolor="rgba(0,255,153,0.06)",
-               tickprefix="$", tickfont=dict(color="rgba(0,255,153,0.7)"),
-               zeroline=True, zerolinecolor="rgba(0,255,153,0.12)",
-               showline=True, linecolor="rgba(0,255,153,0.12)"),
+                font=dict(size=12, color="#00ff99"),
+                bgcolor="rgba(0,0,0,0)"),
+    xaxis=dict(
+        title=dict(text=x_lbl, font=dict(color="rgba(0,255,153,0.6)")),
+        showgrid=True, gridcolor="rgba(0,255,153,0.06)",
+        tickfont=dict(color="rgba(0,255,153,0.6)"),
+        rangeslider=dict(visible=True, bgcolor="#020818", thickness=0.04),
+        showline=True, linecolor="rgba(0,255,153,0.15)"),
+    yaxis=dict(
+        title=dict(text="LMP ($/MWh)", font=dict(color="rgba(0,255,153,0.6)")),
+        showgrid=True, gridcolor="rgba(0,255,153,0.06)",
+        tickprefix="$", tickfont=dict(color="rgba(0,255,153,0.6)"),
+        zeroline=False, showline=True,
+        linecolor="rgba(0,255,153,0.15)"),
     hovermode="x unified",
-    margin=dict(l=60,r=15,t=50,b=40), barmode="group")
+    margin=dict(l=60, r=15, t=50, b=40),
+    barmode="group")
 st.plotly_chart(fig, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
